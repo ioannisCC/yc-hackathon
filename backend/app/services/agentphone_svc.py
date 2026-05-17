@@ -49,14 +49,25 @@ async def ensure_account_webhook() -> str:
 async def provision_for_business(
     business_name: str, system_prompt: str
 ) -> ProvisionResult:
-    """Create an agent, attach a US number, return identifiers."""
-    agent = await asyncio.to_thread(
-        client().agents.create,
-        name=business_name[:60],
-        system_prompt=system_prompt,
-        begin_message=f"Thanks for calling {business_name}, how can I help?",
-        voice_mode="conversational",
+    """Create an agent, attach a US number, return identifiers.
+
+    voice_mode MUST be "webhook" or "hosted". Webhook routes incoming
+    transcripts to our FastAPI /webhooks/agentphone so the Claude tool
+    loop can run; hosted mode keeps reasoning on the AgentPhone side
+    with no tool access."""
+    agent_payload = {
+        "name": business_name[:60],
+        "system_prompt": system_prompt,
+        "begin_message": f"Thanks for calling {business_name}, how can I help?",
+        "voice_mode": "webhook",
+    }
+    # Log everything except the (long) system prompt so a future validation
+    # error surfaces the exact body without flooding logs.
+    log.info(
+        "agentphone agents.create payload: %s",
+        {**agent_payload, "system_prompt": f"<{len(system_prompt)} chars>"},
     )
+    agent = await asyncio.to_thread(client().agents.create, **agent_payload)
     number = await asyncio.to_thread(
         client().numbers.buy, country="US", agent_id=agent.id
     )
