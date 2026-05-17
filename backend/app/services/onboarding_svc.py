@@ -97,14 +97,23 @@ async def onboard_business(url: str) -> Business:
         business_id, "agentmail_inbox", mail_svc.create_inbox(info.name, short)
     )
 
-    # STEP 4 — Cal.com event types (parallel)
+    # STEP 4 — Cal.com event types (parallel, capped at 4 concurrent — Cal.com
+    # event-type creates burst-slow when many fire at once)
     services = info.services or [browser_svc.ServiceInfo(name="Consultation", duration_minutes=30)]
+    sem = asyncio.Semaphore(4)
+
+    async def _bounded(coro):
+        async with sem:
+            return await coro
+
     event_type_ids: list[int] = await _step(
         business_id, "calcom_event_types",
         asyncio.gather(
             *[
-                calcom_svc.create_event_type(
-                    str(business_id), info.name, s.name, s.duration_minutes or 30
+                _bounded(
+                    calcom_svc.create_event_type(
+                        str(business_id), info.name, s.name, s.duration_minutes or 30
+                    )
                 )
                 for s in services
             ]
