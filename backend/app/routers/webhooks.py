@@ -38,7 +38,17 @@ async def agentphone_webhook(
 ) -> StreamingResponse:
     # Raw body MUST be read before FastAPI tries to parse JSON — Standard
     # Webhooks signs the exact bytes the sender transmitted.
-    body = await request.body()
+    raw_body = await request.body()
+
+    # DIAGNOSTIC: dump exactly what AgentPhone is sending so we can stop guessing
+    # the verification protocol. Remove once the 401 mystery is resolved.
+    log.info(
+        "agentphone_webhook_inbound headers=%s body_len=%d body_first_500=%r",
+        {k.lower(): v for k, v in request.headers.items()},
+        len(raw_body),
+        raw_body[:500],
+    )
+
     secret = settings.AGENTPHONE_WEBHOOK_SECRET
     if not secret:
         raise HTTPException(status_code=500, detail="webhook secret not configured")
@@ -46,8 +56,10 @@ async def agentphone_webhook(
         # AgentPhone follows the Standard Webhooks spec (whsec_ prefix,
         # webhook-id / webhook-timestamp / webhook-signature headers).
         # standardwebhooks does the base64-keyed HMAC + tolerance check.
-        payload = Webhook(secret).verify(body, dict(request.headers))
-    except WebhookVerificationError:
+        payload = Webhook(secret).verify(raw_body, dict(request.headers))
+        log.info("agentphone_webhook_verified ok=True")
+    except WebhookVerificationError as e:
+        log.error("agentphone_webhook_verify_failed reason=%s", str(e))
         raise HTTPException(status_code=401, detail="invalid signature")
 
     data = payload.get("data") or {}
