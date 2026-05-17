@@ -3,12 +3,16 @@ Supermemory holds callers; Cal.com holds bookings."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from sqlalchemy import Column, DateTime
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Field, SQLModel
+
+OutboundCallStatus = Literal[
+    "initiating", "ringing", "in_progress", "completed", "failed"
+]
 
 
 def _utcnow() -> datetime:
@@ -101,4 +105,41 @@ class CallLog(SQLModel, table=True):
     # Compact list of tool names — useful for stats queries
     tools_used: list[str] = Field(
         default_factory=list, sa_column=Column(JSONB, nullable=False, default=list)
+    )
+
+
+class OutboundCall(SQLModel, table=True):
+    """An outbound call placed BY our caller agent ON BEHALF OF Sir, dialing a
+    target Business's receptionist. The webhook router uses caller_agent_id +
+    status to find the active OutboundCall for routing transcripts."""
+
+    __tablename__ = "outbound_calls"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+    target_business_id: UUID = Field(foreign_key="businesses.id", index=True)
+    caller_agent_id: str = Field(index=True)
+    intent: str
+    caller_context: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column(JSONB, nullable=False, default=dict)
+    )
+    dynamic_system_prompt: str
+
+    agentphone_call_id: str | None = Field(default=None, index=True)
+    status: str = Field(default="initiating", index=True)
+    error: str | None = None
+
+    ended_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), nullable=True),
+    )
+    end_reason: str | None = None  # "agent_hangup" | "timeout" | "agentphone_event"
+
+    # Links to the CallLog row used to persist the in-flight transcript.
+    call_log_id: UUID | None = Field(
+        default=None, foreign_key="call_logs.id", index=True
     )

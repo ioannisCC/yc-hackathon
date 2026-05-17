@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     # Voice + Phone
     AGENTPHONE_API_KEY: str = ""
     AGENTPHONE_WEBHOOK_SECRET: str = ""
+    # Sir's personal AgentPhone agent — placed on outbound calls to dial other businesses.
+    CALLER_AGENT_ID: str = ""
+    CALLER_AGENT_PHONE_NUMBER: str = ""
+    # Hard cap on outbound call duration. Background watchdog hangs up after this.
+    OUTBOUND_CALL_TIMEOUT_S: int = 180
 
     # Memory layers
     MOSS_PROJECT_ID: str = ""

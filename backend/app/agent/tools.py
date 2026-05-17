@@ -230,6 +230,16 @@ async def escalate_to_human(
     return {"status": "transfer initiated"}
 
 
+async def end_call(
+    _business: Business, _caller: str, farewell_message: str = ""
+) -> dict[str, Any]:
+    """Outbound-only tool. The brain returns end_call=True so the webhook
+    can hang up and mark the OutboundCall completed. Tool result is mostly
+    informational — the spoken farewell is the assistant's text in the same
+    turn, not this return value."""
+    return {"farewell_message": farewell_message, "end_call": True}
+
+
 DISPATCH: dict[str, ToolHandler] = {
     "lookup_business_info": lookup_business_info,
     "get_availability": get_availability,
@@ -239,7 +249,33 @@ DISPATCH: dict[str, ToolHandler] = {
     "recall_caller": recall_caller,
     "remember_about_caller": remember_about_caller,
     "escalate_to_human": escalate_to_human,
+    "end_call": end_call,
 }
+
+
+# Outbound caller agents have NO booking tools — the receiving business agent
+# owns the calendar. The caller only ends the call.
+END_CALL_SCHEMA: dict[str, Any] = {
+    "name": "end_call",
+    "description": (
+        "Hang up the call after a natural farewell. Use ONLY after the goal is "
+        "achieved (booking confirmed, info gathered) or it's clear no progress "
+        "is possible. Always say one short farewell line in the same turn — "
+        "the call ends right after."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "farewell_message": {
+                "type": "string",
+                "description": "One short farewell line, e.g. 'Thanks so much, have a great day!'",
+            },
+        },
+        "required": ["farewell_message"],
+    },
+}
+
+OUTBOUND_TOOL_SCHEMAS: list[dict[str, Any]] = [END_CALL_SCHEMA]
 
 
 async def run_tool(

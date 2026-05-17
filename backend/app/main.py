@@ -12,7 +12,7 @@ from sqlmodel import select
 
 from app.db import init_db, session_scope
 from app.models import Business
-from app.routers import businesses, calls, webhooks
+from app.routers import agents, businesses, calls, webhooks
 from app.services import calcom_svc, mail_svc
 from app.services.email_intent_svc import handle_inbox_event
 
@@ -59,6 +59,7 @@ app.add_middleware(
 app.include_router(businesses.router)
 app.include_router(calls.router)
 app.include_router(webhooks.router)
+app.include_router(agents.router)
 
 
 @app.get("/health")
