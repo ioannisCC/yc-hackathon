@@ -29,82 +29,87 @@ export function OnboardingStepCard({
     <motion.div
       layout
       data-step-id={step.id}
-      initial={{ opacity: 0, y: 18, scale: 0.96 }}
-      animate={{
-        opacity: 1,
-        y: 0,
-        scale: isDone ? 0.98 : 1,
-        height: isDone ? 64 : 96,
-      }}
+      initial={{ opacity: 0, y: 16, scale: 0.96 }}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
       transition={{
         duration: 0.6,
         delay: index * 0.08,
         ease: [0.22, 1, 0.36, 1],
       }}
       className={cn(
-        "relative w-full overflow-hidden rounded-2xl border px-5",
-        "bg-[color-mix(in_oklab,white_3%,transparent)] backdrop-blur-xl",
-        "transition-colors duration-500",
+        "relative isolate w-full rounded-2xl border px-4 sm:px-5 py-3.5 sm:py-4",
+        "backdrop-blur-md transition-[border-color,box-shadow,background-color] duration-500",
         isActive
-          ? "border-cyan-300/45 shadow-[inset_0_0_30px_rgba(34,211,238,0.18),0_0_40px_rgba(34,211,238,0.20)]"
-          : "border-white/8 shadow-[inset_0_1px_0_rgba(255,255,255,0.06),0_4px_24px_rgba(0,0,0,0.35)]",
+          ? "border-cyan-300/40 bg-cyan-400/[0.05] shadow-[inset_0_0_36px_rgba(34,211,238,0.18),0_0_48px_rgba(34,211,238,0.18)]"
+          : isDone
+          ? "border-white/5 bg-white/[0.02] shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]"
+          : "border-white/8 bg-white/[0.03] shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]",
       )}
     >
-      <div className="flex h-full items-center gap-4">
+      <div className="flex items-center gap-3 sm:gap-4">
         <StatusIcon status={step.status} />
-        <div className="flex flex-col gap-0.5 min-w-0">
-          <span
+        <div className="min-w-0 flex-1">
+          <p
             className={cn(
-              "text-base font-medium tracking-tight",
+              "text-sm sm:text-[15px] font-medium leading-tight tracking-tight",
               isDone ? "text-white/55" : "text-white",
             )}
           >
             {step.label}
-          </span>
-          {!isDone && (
-            <span className="text-xs font-normal tracking-wide text-white/40">
+          </p>
+          {!isDone && step.service && (
+            <p className="mt-0.5 text-[11px] sm:text-xs font-normal tracking-[0.08em] uppercase text-white/35">
               {step.service}
-            </span>
+            </p>
           )}
         </div>
         {isCurrent && (
-          <motion.span
-            aria-hidden
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            className="ml-auto text-[10px] uppercase tracking-[0.18em] text-cyan-300/80"
-          >
-            in progress
-          </motion.span>
+          <span className="hidden sm:inline-flex shrink-0 items-center gap-1.5 rounded-full border border-cyan-300/30 bg-cyan-400/[0.08] px-2.5 py-0.5 text-[10px] uppercase tracking-[0.18em] text-cyan-200/90">
+            <span className="h-1 w-1 animate-pulse rounded-full bg-cyan-300" />
+            running
+          </span>
         )}
       </div>
 
-      {/* refractive top-edge */}
+      {/* Refractive top edge */}
       <span
         aria-hidden
-        className="pointer-events-none absolute inset-x-3 top-px h-px bg-gradient-to-r from-transparent via-white/25 to-transparent"
+        className="pointer-events-none absolute inset-x-4 top-px h-px bg-gradient-to-r from-transparent via-white/15 to-transparent"
       />
     </motion.div>
   );
 }
 
 function StatusIcon({ status }: { status: StepStatus }) {
+  const base =
+    "flex h-7 w-7 sm:h-8 sm:w-8 shrink-0 items-center justify-center rounded-full border transition-colors";
+
   if (status === "done") {
     return (
-      <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-cyan-300/40 bg-cyan-300/10">
-        <Check className="h-3.5 w-3.5 text-cyan-200" strokeWidth={3} />
+      <div
+        className={cn(
+          base,
+          "border-cyan-300/40 bg-cyan-300/15 shadow-[0_0_12px_rgba(34,211,238,0.35)]",
+        )}
+      >
+        <Check className="h-3.5 w-3.5 text-cyan-100" strokeWidth={3} />
       </div>
     );
   }
   if (status === "active") {
     return (
-      <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-cyan-300/55 bg-cyan-300/15">
-        <Loader2 className="h-3.5 w-3.5 animate-spin text-cyan-200" />
+      <div
+        className={cn(
+          base,
+          "border-cyan-300/55 bg-cyan-300/15 shadow-[0_0_18px_rgba(34,211,238,0.55)]",
+        )}
+      >
+        <Loader2 className="h-3.5 w-3.5 animate-spin text-cyan-100" />
       </div>
     );
   }
   return (
-    <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-white/15 bg-white/5">
+    <div className={cn(base, "border-white/15 bg-white/5")}>
       <span className="h-1.5 w-1.5 rounded-full bg-white/30" />
     </div>
   );

@@ -8,12 +8,14 @@
 
 html,
 body {
-  background-color: #000;
+  background-color: #020617;
   color: #fafafa;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-/* Hide scrollbar during the onboarding spectacle (the page autoscrolls
-   programmatically so the user never needs to grab the bar). */
+/* Hide scrollbar everywhere during the onboarding spectacle.
+   The active card autoscrolls itself into view programmatically. */
 html,
 body {
   scrollbar-width: none;
@@ -23,8 +25,18 @@ body::-webkit-scrollbar {
   display: none;
 }
 
-/* Slightly tighter selection that matches the cyan ambient */
 ::selection {
   background: rgba(34, 211, 238, 0.35);
   color: #fff;
+}
+
+/* Reduce motion respect — most framer animations are decorative. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

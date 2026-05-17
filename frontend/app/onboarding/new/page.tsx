@@ -1,6 +1,7 @@
 "use client";
 
 import { AnimatePresence, motion } from "framer-motion";
+import { ArrowRight } from "lucide-react";
 import { useRouter } from "next/navigation";
 import {
   useCallback,
@@ -16,6 +17,8 @@ import { LiquidInput } from "@/components/liquid-input";
 import { OnboardingStepCard } from "@/components/onboarding-step-card";
 import { useOnboarding } from "@/hooks/use-onboarding";
 
+const EASE = [0.22, 1, 0.36, 1] as const;
+
 export default function OnboardingNewPage() {
   const router = useRouter();
   const { phase, steps, activeIndex, business, error, submit } = useOnboarding();
@@ -26,12 +29,15 @@ export default function OnboardingNewPage() {
   const inputRef = useRef<HTMLInputElement>(null);
   const cardsRef = useRef<HTMLDivElement>(null);
 
-  // When the dynamic island opens, focus the input
+  // Focus the input the moment the island expands
   useEffect(() => {
-    if (expanded) inputRef.current?.focus();
+    if (expanded) {
+      const t = setTimeout(() => inputRef.current?.focus(), 220);
+      return () => clearTimeout(t);
+    }
   }, [expanded]);
 
-  // After the POST resolves, route to /onboarding/{id} for the "live" state.
+  // Route to the live page after the POST resolves
   useEffect(() => {
     if (phase === "done" && business) {
       const t = setTimeout(() => router.push(`/onboarding/${business.id}`), 900);
@@ -39,7 +45,7 @@ export default function OnboardingNewPage() {
     }
   }, [phase, business, router]);
 
-  // Autoscroll so the currently active card stays vertically centered.
+  // Autoscroll the active step into the centered viewport
   useEffect(() => {
     if (phase !== "running") return;
     const target = cardsRef.current?.querySelector<HTMLElement>(
@@ -48,7 +54,6 @@ export default function OnboardingNewPage() {
     target?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [activeIndex, phase, steps]);
 
-  // Brief shake on error
   useEffect(() => {
     if (phase === "error") {
       setShake(true);
@@ -71,7 +76,7 @@ export default function OnboardingNewPage() {
     [url, submit],
   );
 
-  const islandMode =
+  const islandMode: "collapsed" | "expanded" | "status" =
     phase === "paste"
       ? expanded
         ? "expanded"
@@ -81,36 +86,37 @@ export default function OnboardingNewPage() {
   const currentStep = steps[Math.min(activeIndex, steps.length - 1)];
 
   return (
-    <main className="relative flex min-h-screen flex-col items-center px-6 pt-[18vh] pb-32">
-      {/* HERO copy — only while in paste state */}
-      <AnimatePresence>
+    <main className="relative mx-auto flex min-h-screen w-full max-w-3xl flex-col items-center px-4 pt-[18vh] pb-24 sm:px-6 sm:pt-[22vh]">
+      {/* HERO COPY — only while in paste state */}
+      <AnimatePresence mode="wait">
         {phase === "paste" && (
           <motion.div
-            initial={{ opacity: 0, y: 6 }}
+            key="hero"
+            initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -8 }}
-            transition={{ duration: 0.6, ease: [0.22, 1, 0.36, 1] }}
-            className="mb-10 max-w-2xl text-center"
+            exit={{ opacity: 0, y: -10 }}
+            transition={{ duration: 0.6, ease: EASE }}
+            className="mb-10 text-center sm:mb-12"
           >
-            <h1 className="text-balance text-5xl font-semibold tracking-tight text-white sm:text-6xl">
+            <h1 className="text-balance bg-gradient-to-b from-white to-white/65 bg-clip-text text-4xl font-semibold leading-[1.05] tracking-tight text-transparent sm:text-6xl">
               Answer every call.
             </h1>
-            <p className="mt-4 text-base font-normal tracking-normal text-white/55 sm:text-lg">
-              Paste your business URL. Five minutes later, your business has a
-              phone number staffed by an AI that books real appointments.
+            <p className="mx-auto mt-4 max-w-xl text-balance text-sm font-normal leading-relaxed tracking-normal text-white/55 sm:mt-5 sm:text-base">
+              Paste your business URL. In under five minutes, your business has
+              a phone number staffed by an AI that books real appointments.
             </p>
           </motion.div>
         )}
       </AnimatePresence>
 
-      {/* Dynamic Island */}
-      <div className="w-full max-w-3xl">
+      {/* THE ISLAND */}
+      <div className="w-full">
         <DynamicIsland mode={islandMode}>
           {islandMode === "collapsed" && (
             <button
               type="button"
               onClick={() => setExpanded(true)}
-              className="w-full"
+              className="flex h-full w-full items-center justify-center"
             >
               <CyclingPlaceholder />
             </button>
@@ -119,7 +125,7 @@ export default function OnboardingNewPage() {
           {islandMode === "expanded" && (
             <form
               onSubmit={handleSubmit}
-              className="flex w-full items-center gap-3"
+              className="flex w-full items-center gap-2 sm:gap-3"
             >
               <LiquidInput
                 ref={inputRef}
@@ -133,17 +139,20 @@ export default function OnboardingNewPage() {
                 onChange={(e) => setUrl(e.target.value)}
                 shake={shake}
               />
-              <LiquidButton type="submit">Bring it live</LiquidButton>
+              <LiquidButton type="submit" className="shrink-0">
+                <span className="hidden sm:inline">Bring it live</span>
+                <ArrowRight className="h-4 w-4 sm:hidden" />
+              </LiquidButton>
             </form>
           )}
 
           {islandMode === "status" && currentStep && (
-            <div className="flex w-full items-center gap-3 px-1 text-sm">
-              <span className="inline-flex h-2 w-2 animate-pulse rounded-full bg-cyan-300 shadow-[0_0_12px_rgba(34,211,238,0.9)]" />
-              <span className="font-medium tracking-wide text-white">
+            <div className="flex w-full items-center gap-2.5 sm:gap-3 text-xs sm:text-sm">
+              <span className="inline-flex h-2 w-2 shrink-0 animate-pulse rounded-full bg-cyan-300 shadow-[0_0_12px_rgba(34,211,238,0.9)]" />
+              <span className="truncate font-medium tracking-tight text-white">
                 {currentStep.label}
               </span>
-              <span className="ml-auto text-white/40">
+              <span className="ml-auto shrink-0 font-mono text-[10px] sm:text-xs text-white/40">
                 {Math.min(activeIndex + 1, steps.length)} / {steps.length}
               </span>
             </div>
@@ -158,7 +167,7 @@ export default function OnboardingNewPage() {
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0 }}
               transition={{ duration: 0.4 }}
-              className="mt-4 text-center text-sm font-normal tracking-normal text-red-400/90"
+              className="mt-4 text-center text-xs sm:text-sm font-normal tracking-normal text-red-400/90"
             >
               {error}
             </motion.p>
@@ -166,7 +175,7 @@ export default function OnboardingNewPage() {
         </AnimatePresence>
       </div>
 
-      {/* Step cards — appear during running and done phases */}
+      {/* STEP CARDS — appear during running / done */}
       <AnimatePresence>
         {(phase === "running" || phase === "done") && (
           <motion.div
@@ -174,8 +183,8 @@ export default function OnboardingNewPage() {
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            transition={{ duration: 0.4 }}
-            className="mt-16 flex w-full max-w-xl flex-col gap-3"
+            transition={{ duration: 0.5, ease: EASE }}
+            className="mt-12 flex w-full max-w-xl flex-col gap-2.5 sm:mt-16 sm:gap-3"
           >
             {steps.map((step, i) => (
               <OnboardingStepCard

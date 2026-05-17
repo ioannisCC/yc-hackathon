@@ -6,14 +6,21 @@ import { cn } from "@/lib/utils";
 
 export type IslandMode = "collapsed" | "expanded" | "status";
 
-const MIN_WIDTH: Record<IslandMode, number> = {
-  collapsed: 260,
-  status: 340,
-  expanded: 620,
+const HEIGHT: Record<IslandMode, number> = {
+  collapsed: 48,
+  status: 52,
+  expanded: 64,
 };
 
-/** Apple-style Dynamic Island. Morphs shape via framer layout + state-keyed
- *  child cross-fade. */
+const MIN_WIDTH: Record<IslandMode, { mobile: number; desktop: number }> = {
+  collapsed: { mobile: 240, desktop: 280 },
+  status:    { mobile: 280, desktop: 360 },
+  expanded:  { mobile: 320, desktop: 620 },
+};
+
+/** Apple-style Dynamic Island. Morphs shape via framer layout + width spring;
+ *  children cross-fade keyed on mode. Responsive: caps at viewport - 32px on
+ *  small screens; tightens vertical rhythm. */
 export function DynamicIsland({
   mode,
   children,
@@ -23,16 +30,33 @@ export function DynamicIsland({
   children: ReactNode;
   className?: string;
 }) {
+  // Match the desktop minimum on >=640px, mobile minimum below.
+  const [isDesktop, setIsDesktop] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia("(min-width: 640px)");
+    const update = () => setIsDesktop(mq.matches);
+    update();
+    mq.addEventListener("change", update);
+    return () => mq.removeEventListener("change", update);
+  }, []);
+
+  const minWidth = isDesktop ? MIN_WIDTH[mode].desktop : MIN_WIDTH[mode].mobile;
+
   return (
     <motion.div
       layout
-      transition={{ type: "spring", stiffness: 280, damping: 30, mass: 0.9 }}
-      style={{ minWidth: MIN_WIDTH[mode] }}
+      transition={{ type: "spring", stiffness: 260, damping: 30, mass: 0.85 }}
+      style={{
+        minWidth,
+        height: HEIGHT[mode],
+        maxWidth: "calc(100vw - 32px)",
+      }}
       className={cn(
-        "relative mx-auto flex items-center justify-center",
-        "rounded-full px-5 py-2.5",
-        "bg-black/70 backdrop-blur-2xl border border-white/10",
-        "shadow-[inset_0_1px_0_rgba(255,255,255,0.10),inset_0_-1px_0_rgba(0,0,0,0.6),0_20px_60px_rgba(0,0,0,0.6)]",
+        "relative isolate mx-auto flex items-center justify-center overflow-hidden rounded-full",
+        // Glass surface — flatter and darker than the buttons so the island reads
+        // as the singular "anchor" element of the page.
+        "bg-black/55 backdrop-blur-2xl",
+        "shadow-[inset_0_1px_0_rgba(255,255,255,0.10),inset_0_-1px_0_rgba(0,0,0,0.55),inset_0_0_0_1px_rgba(255,255,255,0.07),0_20px_60px_rgba(0,0,0,0.6),0_0_40px_rgba(34,211,238,0.10)]",
         className,
       )}
     >
@@ -43,7 +67,7 @@ export function DynamicIsland({
           animate={{ opacity: 1, y: 0 }}
           exit={{ opacity: 0, y: -4 }}
           transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }}
-          className="flex w-full items-center justify-center"
+          className="flex h-full w-full items-center justify-center px-4 sm:px-5"
         >
           {children}
         </motion.div>
@@ -52,7 +76,7 @@ export function DynamicIsland({
   );
 }
 
-/* ---------- letter-by-letter cycling placeholder ----------------------------- */
+/* ---------- Cycling placeholder ---------------------------------------------- */
 
 const CYCLE = [
   "paste any business URL",
@@ -61,8 +85,7 @@ const CYCLE = [
   "your agent answers calls",
 ];
 
-/** Renders one phrase at a time, fading letter-by-letter, advancing every
- *  4 seconds. Stagger 50ms. */
+/** Renders one phrase at a time, fading letter-by-letter; advances every 4s. */
 export function CyclingPlaceholder({ className }: { className?: string }) {
   const [i, setI] = useState(0);
 
@@ -77,7 +100,7 @@ export function CyclingPlaceholder({ className }: { className?: string }) {
     <div
       className={cn(
         "pointer-events-none flex h-6 items-center justify-center overflow-hidden",
-        "text-sm font-normal tracking-wide text-white/60",
+        "text-[13px] sm:text-sm font-normal tracking-wide text-white/65",
         className,
       )}
     >
