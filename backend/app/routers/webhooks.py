@@ -9,11 +9,12 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
-from agentphone import WebhookEvent, WebhookVerificationError, construct_event
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
+from standardwebhooks import Webhook
+from standardwebhooks.webhooks import WebhookVerificationError
 
 from app.agent.brain import FALLBACK_REPLY, run_turn
 from app.config import settings
@@ -35,20 +36,25 @@ def _ndjson(chunk: dict[str, Any]) -> bytes:
 async def agentphone_webhook(
     request: Request, db: AsyncSession = Depends(get_session)
 ) -> StreamingResponse:
+    # Raw body MUST be read before FastAPI tries to parse JSON — Standard
+    # Webhooks signs the exact bytes the sender transmitted.
     body = await request.body()
-    signature = request.headers.get("X-Webhook-Signature", "")
     secret = settings.AGENTPHONE_WEBHOOK_SECRET
     if not secret:
         raise HTTPException(status_code=500, detail="webhook secret not configured")
     try:
-        event: WebhookEvent = construct_event(body, signature, secret)
+        # AgentPhone follows the Standard Webhooks spec (whsec_ prefix,
+        # webhook-id / webhook-timestamp / webhook-signature headers).
+        # standardwebhooks does the base64-keyed HMAC + tolerance check.
+        payload = Webhook(secret).verify(body, dict(request.headers))
     except WebhookVerificationError:
         raise HTTPException(status_code=401, detail="invalid signature")
 
-    data = event.data
-    to_number = data.to_number
-    from_number = data.from_number
-    caller_text = data.message or ""
+    data = payload.get("data") or {}
+    to_number = data.get("to_number") or ""
+    from_number = data.get("from_number") or ""
+    caller_text = data.get("message") or ""
+    conversation_id = data.get("conversation_id")
 
     business = (
         await db.execute(select(Business).where(Business.phone_number == to_number))
@@ -58,9 +64,9 @@ async def agentphone_webhook(
 
     # Reconstruct history from recent_history (AgentPhone's rolling context).
     history: list[dict[str, Any]] = []
-    for item in event.recent_history or []:
-        role = "assistant" if getattr(item, "role", "") == "agent" else "user"
-        text = getattr(item, "message", "") or getattr(item, "text", "")
+    for item in payload.get("recent_history") or []:
+        role = "assistant" if item.get("role") == "agent" else "user"
+        text = item.get("message") or item.get("text") or ""
         if text:
             history.append({"role": role, "content": text})
 
@@ -84,7 +90,7 @@ async def agentphone_webhook(
             _persist_turn(
                 business_id=business.id,
                 caller_phone=from_number,
-                conversation_id=data.conversation_id,
+                conversation_id=conversation_id,
                 caller_text=caller_text,
                 reply=reply,
                 tools_used=tools_used,

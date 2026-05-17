@@ -67,15 +67,21 @@ def _make_fake_webhook_payload(business: Business) -> dict[str, Any]:
 async def test_voice_turn_smoke(business: Business) -> None:
     """POSTs a signed fake AgentPhone webhook against a running uvicorn at :8000."""
     print("\n[2/3] voice turn test (requires uvicorn at localhost:8000)…")
-    import hmac
-    import hashlib
+    import uuid
+    from datetime import datetime, timezone
+
+    from standardwebhooks import Webhook
+
     from app.config import settings
 
     payload = _make_fake_webhook_payload(business)
     body = json.dumps(payload).encode()
-    sig = "sha256=" + hmac.new(
-        settings.AGENTPHONE_WEBHOOK_SECRET.encode(), body, hashlib.sha256
-    ).hexdigest()
+    msg_id = f"msg_{uuid.uuid4().hex}"
+    now = datetime.now(timezone.utc)
+    ts = str(int(now.timestamp()))
+    sig = Webhook(settings.AGENTPHONE_WEBHOOK_SECRET).sign(
+        msg_id, now, body.decode()
+    )
 
     async with httpx.AsyncClient(timeout=30) as c:
         async with c.stream(
@@ -84,7 +90,9 @@ async def test_voice_turn_smoke(business: Business) -> None:
             content=body,
             headers={
                 "Content-Type": "application/json",
-                "X-Webhook-Signature": sig,
+                "webhook-id": msg_id,
+                "webhook-timestamp": ts,
+                "webhook-signature": sig,
             },
         ) as r:
             assert r.status_code == 200, f"got {r.status_code}: {await r.aread()}"
