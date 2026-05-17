@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
+import traceback
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from typing import Any
@@ -36,80 +38,124 @@ def _ndjson(chunk: dict[str, Any]) -> bytes:
 async def agentphone_webhook(
     request: Request, db: AsyncSession = Depends(get_session)
 ) -> StreamingResponse:
-    # Raw body MUST be read before FastAPI tries to parse JSON — Standard
-    # Webhooks signs the exact bytes the sender transmitted.
-    raw_body = await request.body()
-
-    # DIAGNOSTIC: dump exactly what AgentPhone is sending so we can stop guessing
-    # the verification protocol. Remove once the 401 mystery is resolved.
-    log.info(
-        "agentphone_webhook_inbound headers=%s body_len=%d body_first_500=%r",
-        {k.lower(): v for k, v in request.headers.items()},
-        len(raw_body),
-        raw_body[:500],
-    )
-
-    secret = settings.AGENTPHONE_WEBHOOK_SECRET
-    if not secret:
-        raise HTTPException(status_code=500, detail="webhook secret not configured")
+    # NUCLEAR DIAGNOSTIC — print() to stderr bypasses uvicorn/loguru filters
+    # and Railway captures stderr unconditionally. flush=True so nothing
+    # is buffered when the handler raises.
+    print("==== AGENTPHONE WEBHOOK START ====", file=sys.stderr, flush=True)
     try:
-        # AgentPhone follows the Standard Webhooks spec (whsec_ prefix,
-        # webhook-id / webhook-timestamp / webhook-signature headers).
-        # standardwebhooks does the base64-keyed HMAC + tolerance check.
-        payload = Webhook(secret).verify(raw_body, dict(request.headers))
-        log.info("agentphone_webhook_verified ok=True")
-    except WebhookVerificationError as e:
-        log.error("agentphone_webhook_verify_failed reason=%s", str(e))
-        raise HTTPException(status_code=401, detail="invalid signature")
+        # Checkpoint 1: headers
+        headers_dict = {k.lower(): v for k, v in request.headers.items()}
+        print(f"[1] HEADERS: {headers_dict}", file=sys.stderr, flush=True)
 
-    data = payload.get("data") or {}
-    to_number = data.get("to_number") or ""
-    from_number = data.get("from_number") or ""
-    caller_text = data.get("message") or ""
-    conversation_id = data.get("conversation_id")
-
-    business = (
-        await db.execute(select(Business).where(Business.phone_number == to_number))
-    ).scalar_one_or_none()
-    if business is None:
-        raise HTTPException(status_code=404, detail=f"no business for {to_number}")
-
-    # Reconstruct history from recent_history (AgentPhone's rolling context).
-    history: list[dict[str, Any]] = []
-    for item in payload.get("recent_history") or []:
-        role = "assistant" if item.get("role") == "agent" else "user"
-        text = item.get("message") or item.get("text") or ""
-        if text:
-            history.append({"role": role, "content": text})
-
-    async def stream() -> AsyncIterator[bytes]:
-        yield _ndjson({"text": INTERIM_FILLER, "interim": True})
+        # Checkpoint 2: body read
         try:
-            reply, tools_used = await asyncio.wait_for(
-                run_turn(business, from_number, caller_text, history),
-                timeout=25,
-            )
+            raw_body = await request.body()
+            print(f"[2] BODY len={len(raw_body)}", file=sys.stderr, flush=True)
+            print(f"[2] BODY first 1000: {raw_body[:1000]!r}", file=sys.stderr, flush=True)
         except Exception as e:
-            log.exception("voice turn failed")
-            log_call_event(
-                business.id, "agent", "turn_failed",
-                {"err": f"{type(e).__name__}: {e}"},
+            print(
+                f"[2] BODY READ FAILED: {type(e).__name__}: {e}",
+                file=sys.stderr, flush=True,
             )
-            reply, tools_used = FALLBACK_REPLY, []
-        yield _ndjson({"text": reply, "interim": False})
-        # Persist transcript turn out-of-band so streaming isn't blocked.
-        asyncio.create_task(
-            _persist_turn(
-                business_id=business.id,
-                caller_phone=from_number,
-                conversation_id=conversation_id,
-                caller_text=caller_text,
-                reply=reply,
-                tools_used=tools_used,
-            )
-        )
+            raise
 
-    return StreamingResponse(stream(), media_type="application/x-ndjson")
+        # Checkpoint 3: secret loaded
+        secret = settings.AGENTPHONE_WEBHOOK_SECRET
+        print(
+            f"[3] SECRET prefix={secret[:10]!r} len={len(secret)}",
+            file=sys.stderr, flush=True,
+        )
+        if not secret:
+            raise HTTPException(status_code=500, detail="webhook secret not configured")
+
+        # Checkpoint 4: attempt verify (lowercased headers first, then original casing)
+        try:
+            wh = Webhook(secret)
+            payload = wh.verify(raw_body, headers_dict)
+            print(
+                f"[4] VERIFY OK payload_type={payload.get('type', payload.get('event', 'unknown'))}",
+                file=sys.stderr, flush=True,
+            )
+        except WebhookVerificationError as e:
+            print(f"[4] VERIFY FAILED: {e}", file=sys.stderr, flush=True)
+            print(f"[4] VERIFY FAILED type: {type(e).__name__}", file=sys.stderr, flush=True)
+            # Casing fallback — in case the SDK is case-sensitive on the headers dict
+            try:
+                wh.verify(raw_body, dict(request.headers))
+                print("[4b] VERIFY with original casing OK", file=sys.stderr, flush=True)
+            except WebhookVerificationError as e2:
+                print(
+                    f"[4b] VERIFY with original casing also failed: {e2}",
+                    file=sys.stderr, flush=True,
+                )
+            raise HTTPException(status_code=401, detail="invalid signature")
+        except Exception as e:
+            print(
+                f"[4] UNEXPECTED EXCEPTION: {type(e).__name__}: {e}",
+                file=sys.stderr, flush=True,
+            )
+            raise
+
+        # ---- existing handler logic continues here -------------------------
+        data = payload.get("data") or {}
+        to_number = data.get("to_number") or ""
+        from_number = data.get("from_number") or ""
+        caller_text = data.get("message") or ""
+        conversation_id = data.get("conversation_id")
+
+        business = (
+            await db.execute(select(Business).where(Business.phone_number == to_number))
+        ).scalar_one_or_none()
+        if business is None:
+            raise HTTPException(status_code=404, detail=f"no business for {to_number}")
+
+        history: list[dict[str, Any]] = []
+        for item in payload.get("recent_history") or []:
+            role = "assistant" if item.get("role") == "agent" else "user"
+            text = item.get("message") or item.get("text") or ""
+            if text:
+                history.append({"role": role, "content": text})
+
+        async def stream() -> AsyncIterator[bytes]:
+            yield _ndjson({"text": INTERIM_FILLER, "interim": True})
+            try:
+                reply, tools_used = await asyncio.wait_for(
+                    run_turn(business, from_number, caller_text, history),
+                    timeout=25,
+                )
+            except Exception as e:
+                log.exception("voice turn failed")
+                log_call_event(
+                    business.id, "agent", "turn_failed",
+                    {"err": f"{type(e).__name__}: {e}"},
+                )
+                reply, tools_used = FALLBACK_REPLY, []
+            yield _ndjson({"text": reply, "interim": False})
+            asyncio.create_task(
+                _persist_turn(
+                    business_id=business.id,
+                    caller_phone=from_number,
+                    conversation_id=conversation_id,
+                    caller_text=caller_text,
+                    reply=reply,
+                    tools_used=tools_used,
+                )
+            )
+
+        return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(
+            f"[X] HANDLER CRASHED: {type(e).__name__}: {e}",
+            file=sys.stderr, flush=True,
+        )
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        raise
+    finally:
+        print("==== AGENTPHONE WEBHOOK END ====", file=sys.stderr, flush=True)
 
 
 async def _persist_turn(
