@@ -33,21 +33,44 @@ def client() -> AsyncAnthropic:
 
 
 def _text_from_blocks(blocks: list[Any]) -> str:
-    return "".join(getattr(b, "text", "") for b in blocks if getattr(b, "type", "") == "text")
+    return "".join(
+        getattr(b, "text", "") for b in blocks if getattr(b, "type", "") == "text"
+    )
+
+
+def _convert_recent_history(recent_history: list[Any]) -> list[dict[str, Any]]:
+    """AgentPhone sends history as [{role: 'agent'|'user', content: str}, ...].
+    Anthropic expects [{role: 'assistant'|'user', content: str}, ...]."""
+    out: list[dict[str, Any]] = []
+    for item in recent_history:
+        if not isinstance(item, dict):
+            continue
+        raw_role = item.get("role", "")
+        role = "assistant" if raw_role == "agent" else "user"
+        content = item.get("content") or item.get("text") or ""
+        if content:
+            out.append({"role": role, "content": str(content)})
+    return out
 
 
 async def run_turn(
+    *,
     business: Business,
-    caller_phone: str,
-    caller_text: str,
-    history: list[dict[str, Any]],
+    caller_number: str,
+    caller_transcript: str,
+    recent_history: list[Any],
 ) -> tuple[str, list[str]]:
-    """Run one turn of the voice agent. Returns (reply_text, tools_used_names).
+    """Run one turn of the voice agent. Returns (reply_text, tool_names_used).
 
-    `history` is the list of prior Anthropic messages and is mutated in place
-    to include this turn's user/assistant/tool_result blocks.
-    """
-    history.append({"role": "user", "content": caller_text})
+    `caller_transcript` is what the caller JUST said this turn.
+    `recent_history` is AgentPhone's rolling context (excludes the new utterance).
+    `caller_number` is the caller's phone — used by recall/remember tools."""
+    if not business.system_prompt:
+        log.warning("business %s has no system_prompt — returning fallback", business.id)
+        return FALLBACK_REPLY, []
+
+    history = _convert_recent_history(recent_history)
+    history.append({"role": "user", "content": caller_transcript or "(silence)"})
     tools_used: list[str] = []
 
     for _ in range(MAX_TOOL_ITERATIONS):
@@ -59,21 +82,20 @@ async def run_turn(
             messages=history,
         )
 
-        # Append the assistant's full message (text + any tool_use blocks) to history
-        history.append({"role": "assistant", "content": [b.model_dump() for b in resp.content]})
+        history.append(
+            {"role": "assistant", "content": [b.model_dump() for b in resp.content]}
+        )
 
         if resp.stop_reason == "end_turn":
             return _text_from_blocks(resp.content) or FALLBACK_REPLY, tools_used
 
         if resp.stop_reason == "tool_use":
             tool_calls = [b for b in resp.content if getattr(b, "type", "") == "tool_use"]
-            # Dispatch all tool calls for this turn in parallel
             results = await asyncio.gather(
                 *[
-                    run_tool(tc.name, business, caller_phone, tc.input or {})
+                    run_tool(tc.name, business, caller_number, tc.input or {})
                     for tc in tool_calls
-                ],
-                return_exceptions=False,
+                ]
             )
             tool_result_blocks: list[dict[str, Any]] = []
             for tc, out in zip(tool_calls, results):
@@ -92,10 +114,10 @@ async def run_turn(
             history.append({"role": "user", "content": tool_result_blocks})
             continue
 
-        # Any other stop_reason (e.g., max_tokens) — return what we have
+        # max_tokens or any other stop_reason — return whatever text we have
         return _text_from_blocks(resp.content) or FALLBACK_REPLY, tools_used
 
-    log.warning("Tool loop exhausted %d iterations", MAX_TOOL_ITERATIONS)
+    log.warning("tool loop exhausted %d iterations", MAX_TOOL_ITERATIONS)
     return FALLBACK_REPLY, tools_used
 
 

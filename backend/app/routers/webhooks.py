@@ -1,256 +1,297 @@
-"""AgentPhone webhook — verify signature, run Claude tool loop, stream NDJSON.
-
-AgentPhone uses GitHub-style HMAC-SHA256, NOT Standard Webhooks. The
-verifier below runs all 9 plausible (secret-format × payload-shape)
-combinations and accepts on any match, logging which combo won so we
-can collapse to a single one once observed in production logs.
-"""
+"""AgentPhone webhook — verify, dedup, route by event, generate reply."""
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import hmac
 import json
 import logging
-import sys
-import traceback
-from collections.abc import AsyncIterator
+import threading
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.agent.brain import FALLBACK_REPLY, run_turn
 from app.config import settings
-from app.db import get_session, session_scope
+from app.db import session_scope
 from app.models import Business, CallLog
 from app.services.logging_svc import log_call_event
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
-INTERIM_FILLER = "One moment."
+# AgentPhone webhook timeout is short (~30s). Cap the brain so we always
+# get a reply text out the door in time.
+BRAIN_TIMEOUT_S = 25.0
 
 
-def _ndjson(chunk: dict[str, Any]) -> bytes:
-    return (json.dumps(chunk) + "\n").encode()
+# ---------- Signature verification (winning combo) ----------------------------
 
 
 def verify_agentphone_webhook(
-    raw_body: bytes, headers: dict[str, str], secret_full: str
+    raw_body: bytes, headers: dict[str, str], secret: str
 ) -> bool:
-    """Try every plausible (secret, payload) pair until one matches.
-
-    Logs each attempt's outcome and the winning combo so we can collapse
-    this to a single canonical pair once we've observed real traffic."""
+    """Collapsed to the proven combination from prod logs:
+       HMAC-SHA256(secret_full_with_whsec_prefix, f"{ts}.{body}")"""
     sig_header = headers.get("x-webhook-signature", "")
     ts = headers.get("x-webhook-timestamp", "")
-    wh_id = headers.get("x-webhook-id", "")
-
     if not sig_header.startswith("sha256="):
-        print(
-            f"[VERIFY] Missing or unexpected sig header: {sig_header!r}",
-            file=sys.stderr, flush=True,
-        )
         return False
     provided_hex = sig_header.removeprefix("sha256=")
+    signed = f"{ts}.".encode() + raw_body
+    computed = hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(computed, provided_hex)
 
-    try:
-        b64_key = base64.urlsafe_b64decode(
-            secret_full.removeprefix("whsec_") + "==="
+
+# ---------- Idempotency cache (LRU keyed on x-webhook-id) ---------------------
+# AgentPhone may retry on transport failure. Re-running brain.py would
+# double-bill Claude tokens and double-write transcripts. We cache the full
+# response so duplicates return byte-identical answers without re-work.
+
+_DEDUP_MAX = 1000
+_seen_responses: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_seen_lock = threading.Lock()
+
+
+def _check_dedup(webhook_id: str) -> dict[str, Any] | None:
+    if not webhook_id:
+        return None
+    with _seen_lock:
+        cached = _seen_responses.get(webhook_id)
+        if cached is not None:
+            _seen_responses.move_to_end(webhook_id)
+            return cached
+    return None
+
+
+def _record_response(webhook_id: str, response: dict[str, Any]) -> None:
+    if not webhook_id:
+        return
+    with _seen_lock:
+        _seen_responses[webhook_id] = response
+        while len(_seen_responses) > _DEDUP_MAX:
+            _seen_responses.popitem(last=False)
+
+
+# ---------- DB helpers --------------------------------------------------------
+
+
+async def get_business_by_agent_id(agent_id: str) -> Business | None:
+    async with session_scope() as s:
+        r = await s.execute(
+            select(Business).where(Business.agentphone_agent_id == agent_id)
         )
-    except Exception as e:
-        print(f"[VERIFY] base64 decode failed: {e}", file=sys.stderr, flush=True)
-        b64_key = b""
+        return r.scalar_one_or_none()
 
-    secret_variants = {
-        "full": secret_full.encode(),
-        "stripped": secret_full.removeprefix("whsec_").encode(),
-        "b64_urlsafe": b64_key,
-    }
-    payload_variants = {
-        "body_only": raw_body,
-        "ts_dot_body": f"{ts}.".encode() + raw_body,
-        "id_dot_ts_dot_body": f"{wh_id}.{ts}.".encode() + raw_body,
-    }
 
-    for s_name, s_key in secret_variants.items():
-        if not s_key:
-            continue
-        for p_name, payload in payload_variants.items():
-            computed = hmac.new(s_key, payload, hashlib.sha256).hexdigest()
-            match = hmac.compare_digest(computed, provided_hex)
-            print(
-                f"[VERIFY] secret={s_name} payload={p_name} match={match}",
-                file=sys.stderr, flush=True,
-            )
-            if match:
-                print(
-                    f"[VERIFY] *** WINNER: secret={s_name} payload={p_name} ***",
-                    file=sys.stderr, flush=True,
-                )
-                return True
-    return False
+async def _find_existing_call(
+    s: AsyncSession,
+    *,
+    business_id: UUID,
+    call_id: str | None,
+    caller_phone: str,
+) -> CallLog | None:
+    if call_id:
+        r = await s.execute(
+            select(CallLog).where(CallLog.conversation_id == call_id)
+        )
+        existing = r.scalar_one_or_none()
+        if existing is not None:
+            return existing
+    # AgentPhone sometimes sends callId=null on the first message of a call.
+    # Fall back to "most recent in_progress call for this caller_phone".
+    if caller_phone:
+        r = await s.execute(
+            select(CallLog)
+            .where(CallLog.business_id == business_id)
+            .where(CallLog.caller_phone == caller_phone)
+            .where(CallLog.status == "in_progress")
+            .order_by(CallLog.started_at.desc())
+            .limit(1)
+        )
+        return r.scalar_one_or_none()
+    return None
+
+
+# ---------- Main handler ------------------------------------------------------
 
 
 @router.post("/agentphone")
-async def agentphone_webhook(
-    request: Request, db: AsyncSession = Depends(get_session)
-) -> StreamingResponse:
-    # NUCLEAR DIAGNOSTIC — print() to stderr bypasses uvicorn/loguru filters
-    # and Railway captures stderr unconditionally. flush=True so nothing
-    # is buffered when the handler raises.
-    print("==== AGENTPHONE WEBHOOK START ====", file=sys.stderr, flush=True)
+async def agentphone_webhook(request: Request) -> dict[str, Any]:
+    raw_body = await request.body()
+    headers = {k.lower(): v for k, v in request.headers.items()}
+
+    secret = settings.AGENTPHONE_WEBHOOK_SECRET
+    if not secret:
+        raise HTTPException(status_code=500, detail="webhook secret not configured")
+
+    if not verify_agentphone_webhook(raw_body, headers, secret):
+        raise HTTPException(status_code=401, detail="invalid signature")
+
+    webhook_id = headers.get("x-webhook-id", "")
+    cached = _check_dedup(webhook_id)
+    if cached is not None:
+        return cached
+
     try:
-        # Checkpoint 1: headers
-        headers_dict = {k.lower(): v for k, v in request.headers.items()}
-        print(f"[1] HEADERS: {headers_dict}", file=sys.stderr, flush=True)
+        payload: dict[str, Any] = json.loads(raw_body)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="invalid json")
 
-        # Checkpoint 2: body read
+    event_type = headers.get("x-webhook-event") or payload.get("event") or ""
+    agent_id = payload.get("agentId") or ""
+    data: dict[str, Any] = payload.get("data") or {}
+    call_id_value = data.get("callId")
+    call_id: str | None = call_id_value if isinstance(call_id_value, str) else None
+    call_status = data.get("status")
+
+    log.info(
+        "agentphone_webhook event=%s agent_id=%s call_id=%s status=%s",
+        event_type, agent_id, call_id, call_status,
+    )
+
+    if not agent_id:
+        return _ack(webhook_id, {"ok": True})
+
+    business = await get_business_by_agent_id(agent_id)
+    if business is None:
+        log.warning("webhook for unknown agent_id=%s — returning 200", agent_id)
+        return _ack(webhook_id, {"ok": True})
+
+    if event_type == "agent.message":
+        caller_transcript = str(data.get("transcript") or "")
+        caller_number = str(data.get("from") or "")
+        recent_history = payload.get("recentHistory") or []
+
         try:
-            raw_body = await request.body()
-            print(f"[2] BODY len={len(raw_body)}", file=sys.stderr, flush=True)
-            print(f"[2] BODY first 1000: {raw_body[:1000]!r}", file=sys.stderr, flush=True)
+            reply_text, tools_used = await asyncio.wait_for(
+                run_turn(
+                    business=business,
+                    caller_number=caller_number,
+                    caller_transcript=caller_transcript,
+                    recent_history=recent_history,
+                ),
+                timeout=BRAIN_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            log.warning("brain.run_turn timed out after %.0fs", BRAIN_TIMEOUT_S)
+            reply_text, tools_used = FALLBACK_REPLY, []
         except Exception as e:
-            print(
-                f"[2] BODY READ FAILED: {type(e).__name__}: {e}",
-                file=sys.stderr, flush=True,
+            log.exception("brain.run_turn failed")
+            log_call_event(
+                business.id, "agent", "turn_failed",
+                {"err": f"{type(e).__name__}: {e}"},
             )
-            raise
+            reply_text, tools_used = FALLBACK_REPLY, []
 
-        # Checkpoint 3: secret loaded
-        secret = settings.AGENTPHONE_WEBHOOK_SECRET
-        print(
-            f"[3] SECRET prefix={secret[:10]!r} len={len(secret)}",
-            file=sys.stderr, flush=True,
-        )
-        if not secret:
-            raise HTTPException(status_code=500, detail="webhook secret not configured")
-
-        # Checkpoint 4: 9-way HMAC discovery
-        if not verify_agentphone_webhook(raw_body, headers_dict, secret):
-            raise HTTPException(status_code=401, detail="invalid signature")
-        try:
-            payload = json.loads(raw_body)
-        except json.JSONDecodeError as e:
-            print(f"[4] JSON DECODE FAILED: {e}", file=sys.stderr, flush=True)
-            raise HTTPException(status_code=400, detail="invalid json")
-        print(
-            f"[4] PAYLOAD type={payload.get('type', payload.get('event', 'unknown'))}",
-            file=sys.stderr, flush=True,
-        )
-
-        # ---- existing handler logic continues here -------------------------
-        data = payload.get("data") or {}
-        to_number = data.get("to_number") or ""
-        from_number = data.get("from_number") or ""
-        caller_text = data.get("message") or ""
-        conversation_id = data.get("conversation_id")
-
-        business = (
-            await db.execute(select(Business).where(Business.phone_number == to_number))
-        ).scalar_one_or_none()
-        if business is None:
-            raise HTTPException(status_code=404, detail=f"no business for {to_number}")
-
-        history: list[dict[str, Any]] = []
-        for item in payload.get("recent_history") or []:
-            role = "assistant" if item.get("role") == "agent" else "user"
-            text = item.get("message") or item.get("text") or ""
-            if text:
-                history.append({"role": role, "content": text})
-
-        async def stream() -> AsyncIterator[bytes]:
-            yield _ndjson({"text": INTERIM_FILLER, "interim": True})
-            try:
-                reply, tools_used = await asyncio.wait_for(
-                    run_turn(business, from_number, caller_text, history),
-                    timeout=25,
-                )
-            except Exception as e:
-                log.exception("voice turn failed")
-                log_call_event(
-                    business.id, "agent", "turn_failed",
-                    {"err": f"{type(e).__name__}: {e}"},
-                )
-                reply, tools_used = FALLBACK_REPLY, []
-            yield _ndjson({"text": reply, "interim": False})
-            asyncio.create_task(
-                _persist_turn(
-                    business_id=business.id,
-                    caller_phone=from_number,
-                    conversation_id=conversation_id,
-                    caller_text=caller_text,
-                    reply=reply,
-                    tools_used=tools_used,
-                )
+        # Fire-and-forget persistence so the spoken reply isn't blocked on DB I/O.
+        asyncio.create_task(
+            _persist_chunk(
+                business_id=business.id,
+                call_id=call_id,
+                caller_phone=caller_number,
+                caller_text=caller_transcript,
+                reply_text=reply_text,
+                tools_used=tools_used,
             )
-
-        return StreamingResponse(stream(), media_type="application/x-ndjson")
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(
-            f"[X] HANDLER CRASHED: {type(e).__name__}: {e}",
-            file=sys.stderr, flush=True,
         )
-        traceback.print_exc(file=sys.stderr)
-        sys.stderr.flush()
-        raise
-    finally:
-        print("==== AGENTPHONE WEBHOOK END ====", file=sys.stderr, flush=True)
+
+        return _ack(webhook_id, {"text": reply_text, "interim": False})
+
+    if event_type == "agent.call_ended":
+        asyncio.create_task(
+            _persist_call_ended(
+                business_id=business.id,
+                call_id=call_id,
+                caller_phone=str(data.get("from") or ""),
+            )
+        )
+        return _ack(webhook_id, {"ok": True})
+
+    log.warning("unknown webhook event_type=%s — returning 200", event_type)
+    return _ack(webhook_id, {"ok": True})
 
 
-async def _persist_turn(
+def _ack(webhook_id: str, response: dict[str, Any]) -> dict[str, Any]:
+    """Cache + return — single exit point so dedup stays in sync."""
+    _record_response(webhook_id, response)
+    return response
+
+
+# ---------- Persistence -------------------------------------------------------
+
+
+async def _persist_chunk(
     business_id: UUID,
+    call_id: str | None,
     caller_phone: str,
-    conversation_id: str | None,
     caller_text: str,
-    reply: str,
+    reply_text: str,
     tools_used: list[str],
 ) -> None:
-    """Incremental write: append caller + agent chunks, accumulate tool_calls,
-    keep status='in_progress' so the SSE stream stays open."""
-    now = datetime.now(timezone.utc).isoformat()
-    new_chunks: list[dict[str, Any]] = [
-        {"role": "caller", "text": caller_text, "ts": now},
-        {"role": "agent", "text": reply, "ts": now},
-    ]
+    now_iso = datetime.now(timezone.utc).isoformat()
+    new_chunks: list[dict[str, Any]] = []
+    if caller_text:
+        new_chunks.append({"role": "caller", "text": caller_text, "ts": now_iso})
+    new_chunks.append({"role": "agent", "text": reply_text, "ts": now_iso})
+
     new_tool_records: list[dict[str, Any]] = [
-        {"name": t, "ts": now} for t in tools_used
+        {"name": t, "ts": now_iso} for t in tools_used
     ]
 
-    async with session_scope() as s:
-        existing = None
-        if conversation_id:
-            existing = (
-                await s.execute(
-                    select(CallLog).where(CallLog.conversation_id == conversation_id)
+    try:
+        async with session_scope() as s:
+            existing = await _find_existing_call(
+                s, business_id=business_id, call_id=call_id, caller_phone=caller_phone,
+            )
+            if existing is None:
+                row = CallLog(
+                    business_id=business_id,
+                    caller_phone=caller_phone,
+                    conversation_id=call_id,
+                    status="in_progress",
+                    transcript=new_chunks,
+                    tool_calls=new_tool_records,
+                    tools_used=list(dict.fromkeys(tools_used)),
                 )
-            ).scalar_one_or_none()
-        if existing is None:
-            row = CallLog(
-                business_id=business_id,
-                caller_phone=caller_phone,
-                conversation_id=conversation_id,
-                status="in_progress",
-                transcript=new_chunks,
-                tool_calls=new_tool_records,
-                tools_used=list(dict.fromkeys(tools_used)),
+                s.add(row)
+            else:
+                existing.transcript = (existing.transcript or []) + new_chunks
+                existing.tool_calls = (existing.tool_calls or []) + new_tool_records
+                existing.tools_used = list(
+                    dict.fromkeys((existing.tools_used or []) + tools_used)
+                )
+                existing.status = "in_progress"
+                if call_id and not existing.conversation_id:
+                    existing.conversation_id = call_id
+                s.add(existing)
+            await s.commit()
+    except Exception:
+        log.exception("persist_chunk failed (call still served)")
+
+
+async def _persist_call_ended(
+    business_id: UUID,
+    call_id: str | None,
+    caller_phone: str,
+) -> None:
+    try:
+        async with session_scope() as s:
+            existing = await _find_existing_call(
+                s, business_id=business_id, call_id=call_id, caller_phone=caller_phone,
             )
-            s.add(row)
-        else:
-            existing.transcript = (existing.transcript or []) + new_chunks
-            existing.tool_calls = (existing.tool_calls or []) + new_tool_records
-            existing.tools_used = list(
-                dict.fromkeys((existing.tools_used or []) + tools_used)
-            )
-            existing.status = "in_progress"
+            if existing is None:
+                return
+            existing.status = "completed"
+            existing.ended_at = datetime.now(timezone.utc)
+            if call_id and not existing.conversation_id:
+                existing.conversation_id = call_id
             s.add(existing)
-        await s.commit()
+            await s.commit()
+    except Exception:
+        log.exception("persist_call_ended failed")
