@@ -46,7 +46,10 @@ async def create_event_type(
     service_name: str,
     duration_minutes: int = 30,
 ) -> int:
-    """Create a per-service event type tagged with business_id metadata."""
+    """Create a per-service event type tagged with business_id metadata.
+
+    Cal.com versions endpoints separately: event-types REQUIRES 2024-06-14,
+    not the 2024-08-13 we use for bookings/slots. Wrong version → 404."""
     title = f"{business_name} - {service_name}"
     body = {
         "title": title,
@@ -54,7 +57,11 @@ async def create_event_type(
         "lengthInMinutes": duration_minutes,
         "metadata": {"business_id": business_id, "service_name": service_name},
     }
-    r = await _client().post("/event-types", json=body)
+    r = await _client().post(
+        "/event-types",
+        json=body,
+        headers={"cal-api-version": "2024-06-14"},
+    )
     r.raise_for_status()
     data = r.json().get("data", {})
     return int(data["id"])
