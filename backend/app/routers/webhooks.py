@@ -17,10 +17,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.agent.brain import FALLBACK_REPLY, run_turn
+from app.agent.tools import OUTBOUND_TOOL_SCHEMAS
 from app.config import settings
 from app.db import session_scope
-from app.models import Business, CallLog
+from app.models import Business, CallLog, OutboundCall
 from app.services.logging_svc import log_call_event
+from app.services.outbound_svc import (
+    cancel_watchdog,
+    get_active_outbound_call_by_caller_agent_id,
+    hangup_agentphone_call,
+    update_outbound_status,
+)
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
@@ -158,7 +165,19 @@ async def agentphone_webhook(request: Request) -> dict[str, Any]:
     if not agent_id:
         return _ack(webhook_id, {"ok": True})
 
+    # Resolve the agent: inbound (Business) first, then outbound (OutboundCall).
     business = await get_business_by_agent_id(agent_id)
+    outbound_call: OutboundCall | None = None
+    outbound_target: Business | None = None
+    if business is None:
+        active = await get_active_outbound_call_by_caller_agent_id(agent_id)
+        if active is not None:
+            outbound_call, outbound_target = active
+            # For the brain, the "active business context" is the TARGET we're
+            # dialing — that's what the synthesized prompt references. The
+            # caller agent does not use the target's tool list though.
+            business = outbound_target
+
     if business is None:
         log.warning("webhook for unknown agent_id=%s — returning 200", agent_id)
         return _ack(webhook_id, {"ok": True})
@@ -168,13 +187,23 @@ async def agentphone_webhook(request: Request) -> dict[str, Any]:
         caller_number = str(data.get("from") or "")
         recent_history = payload.get("recentHistory") or []
 
+        if outbound_call is not None:
+            system_prompt_override: str | None = outbound_call.dynamic_system_prompt
+            tools_override: list[Any] | None = OUTBOUND_TOOL_SCHEMAS
+        else:
+            system_prompt_override = None
+            tools_override = None
+
+        end_call = False
         try:
-            reply_text, tools_used = await asyncio.wait_for(
+            reply_text, tools_used, end_call = await asyncio.wait_for(
                 run_turn(
                     business=business,
                     caller_number=caller_number,
                     caller_transcript=caller_transcript,
                     recent_history=recent_history,
+                    system_prompt_override=system_prompt_override,
+                    tools_override=tools_override,
                 ),
                 timeout=BRAIN_TIMEOUT_S,
             )
@@ -198,8 +227,25 @@ async def agentphone_webhook(request: Request) -> dict[str, Any]:
                 caller_text=caller_transcript,
                 reply_text=reply_text,
                 tools_used=tools_used,
+                outbound_call_id=outbound_call.id if outbound_call else None,
             )
         )
+
+        if outbound_call is not None:
+            # First inbound transcript flips ringing → in_progress.
+            if outbound_call.status in ("initiating", "ringing"):
+                asyncio.create_task(
+                    update_outbound_status(outbound_call.id, status="in_progress")
+                )
+            if end_call:
+                asyncio.create_task(
+                    _finalize_outbound_call(
+                        outbound_call_id=outbound_call.id,
+                        agentphone_call_id=outbound_call.agentphone_call_id,
+                        end_reason="agent_hangup",
+                    )
+                )
+                return _ack(webhook_id, {"text": reply_text, "interim": False, "end_call": True})
 
         return _ack(webhook_id, {"text": reply_text, "interim": False})
 
@@ -211,6 +257,14 @@ async def agentphone_webhook(request: Request) -> dict[str, Any]:
                 caller_phone=str(data.get("from") or ""),
             )
         )
+        if outbound_call is not None:
+            asyncio.create_task(
+                _finalize_outbound_call(
+                    outbound_call_id=outbound_call.id,
+                    agentphone_call_id=None,  # already ended remotely
+                    end_reason="agentphone_event",
+                )
+            )
         return _ack(webhook_id, {"ok": True})
 
     log.warning("unknown webhook event_type=%s — returning 200", event_type)
@@ -233,11 +287,15 @@ async def _persist_chunk(
     caller_text: str,
     reply_text: str,
     tools_used: list[str],
+    outbound_call_id: UUID | None = None,
 ) -> None:
     now_iso = datetime.now(timezone.utc).isoformat()
     new_chunks: list[dict[str, Any]] = []
     if caller_text:
-        new_chunks.append({"role": "caller", "text": caller_text, "ts": now_iso})
+        # On outbound calls the "caller" voice on the line is the TARGET
+        # business's AI receptionist. Tag the role so the dashboard can render.
+        role = "target_agent" if outbound_call_id else "caller"
+        new_chunks.append({"role": role, "text": caller_text, "ts": now_iso})
     new_chunks.append({"role": "agent", "text": reply_text, "ts": now_iso})
 
     new_tool_records: list[dict[str, Any]] = [
@@ -246,9 +304,15 @@ async def _persist_chunk(
 
     try:
         async with session_scope() as s:
-            existing = await _find_existing_call(
-                s, business_id=business_id, call_id=call_id, caller_phone=caller_phone,
-            )
+            existing: CallLog | None = None
+            if outbound_call_id is not None:
+                outbound = await s.get(OutboundCall, outbound_call_id)
+                if outbound is not None and outbound.call_log_id is not None:
+                    existing = await s.get(CallLog, outbound.call_log_id)
+            if existing is None:
+                existing = await _find_existing_call(
+                    s, business_id=business_id, call_id=call_id, caller_phone=caller_phone,
+                )
             if existing is None:
                 row = CallLog(
                     business_id=business_id,
@@ -260,6 +324,12 @@ async def _persist_chunk(
                     tools_used=list(dict.fromkeys(tools_used)),
                 )
                 s.add(row)
+                await s.flush()
+                if outbound_call_id is not None:
+                    outbound = await s.get(OutboundCall, outbound_call_id)
+                    if outbound is not None and outbound.call_log_id is None:
+                        outbound.call_log_id = row.id
+                        s.add(outbound)
             else:
                 existing.transcript = (existing.transcript or []) + new_chunks
                 existing.tool_calls = (existing.tool_calls or []) + new_tool_records
@@ -270,9 +340,39 @@ async def _persist_chunk(
                 if call_id and not existing.conversation_id:
                     existing.conversation_id = call_id
                 s.add(existing)
+                if outbound_call_id is not None:
+                    outbound = await s.get(OutboundCall, outbound_call_id)
+                    if outbound is not None and outbound.call_log_id is None:
+                        outbound.call_log_id = existing.id
+                        s.add(outbound)
             await s.commit()
     except Exception:
         log.exception("persist_chunk failed (call still served)")
+
+
+async def _finalize_outbound_call(
+    *,
+    outbound_call_id: UUID,
+    agentphone_call_id: str | None,
+    end_reason: str,
+) -> None:
+    """Mark an OutboundCall completed + cancel watchdog + best-effort hangup."""
+    cancel_watchdog(outbound_call_id)
+    if agentphone_call_id:
+        try:
+            await hangup_agentphone_call(agentphone_call_id)
+        except Exception:
+            log.exception("hangup failed for outbound_call=%s", outbound_call_id)
+    await update_outbound_status(
+        outbound_call_id,
+        status="completed",
+        end_reason=end_reason,
+        set_ended_at=True,
+    )
+    log_call_event(
+        None, "outbound", "finalized",
+        {"outbound_call_id": str(outbound_call_id), "reason": end_reason},
+    )
 
 
 async def _persist_call_ended(
