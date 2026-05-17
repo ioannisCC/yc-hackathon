@@ -1,7 +1,16 @@
-"""AgentPhone webhook — verify signature, run Claude tool loop, stream NDJSON."""
+"""AgentPhone webhook — verify signature, run Claude tool loop, stream NDJSON.
+
+AgentPhone uses GitHub-style HMAC-SHA256, NOT Standard Webhooks. The
+verifier below runs all 9 plausible (secret-format × payload-shape)
+combinations and accepts on any match, logging which combo won so we
+can collapse to a single one once observed in production logs.
+"""
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import sys
@@ -15,8 +24,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
-from standardwebhooks import Webhook
-from standardwebhooks.webhooks import WebhookVerificationError
 
 from app.agent.brain import FALLBACK_REPLY, run_turn
 from app.config import settings
@@ -32,6 +39,63 @@ INTERIM_FILLER = "One moment."
 
 def _ndjson(chunk: dict[str, Any]) -> bytes:
     return (json.dumps(chunk) + "\n").encode()
+
+
+def verify_agentphone_webhook(
+    raw_body: bytes, headers: dict[str, str], secret_full: str
+) -> bool:
+    """Try every plausible (secret, payload) pair until one matches.
+
+    Logs each attempt's outcome and the winning combo so we can collapse
+    this to a single canonical pair once we've observed real traffic."""
+    sig_header = headers.get("x-webhook-signature", "")
+    ts = headers.get("x-webhook-timestamp", "")
+    wh_id = headers.get("x-webhook-id", "")
+
+    if not sig_header.startswith("sha256="):
+        print(
+            f"[VERIFY] Missing or unexpected sig header: {sig_header!r}",
+            file=sys.stderr, flush=True,
+        )
+        return False
+    provided_hex = sig_header.removeprefix("sha256=")
+
+    try:
+        b64_key = base64.urlsafe_b64decode(
+            secret_full.removeprefix("whsec_") + "==="
+        )
+    except Exception as e:
+        print(f"[VERIFY] base64 decode failed: {e}", file=sys.stderr, flush=True)
+        b64_key = b""
+
+    secret_variants = {
+        "full": secret_full.encode(),
+        "stripped": secret_full.removeprefix("whsec_").encode(),
+        "b64_urlsafe": b64_key,
+    }
+    payload_variants = {
+        "body_only": raw_body,
+        "ts_dot_body": f"{ts}.".encode() + raw_body,
+        "id_dot_ts_dot_body": f"{wh_id}.{ts}.".encode() + raw_body,
+    }
+
+    for s_name, s_key in secret_variants.items():
+        if not s_key:
+            continue
+        for p_name, payload in payload_variants.items():
+            computed = hmac.new(s_key, payload, hashlib.sha256).hexdigest()
+            match = hmac.compare_digest(computed, provided_hex)
+            print(
+                f"[VERIFY] secret={s_name} payload={p_name} match={match}",
+                file=sys.stderr, flush=True,
+            )
+            if match:
+                print(
+                    f"[VERIFY] *** WINNER: secret={s_name} payload={p_name} ***",
+                    file=sys.stderr, flush=True,
+                )
+                return True
+    return False
 
 
 @router.post("/agentphone")
@@ -68,33 +132,18 @@ async def agentphone_webhook(
         if not secret:
             raise HTTPException(status_code=500, detail="webhook secret not configured")
 
-        # Checkpoint 4: attempt verify (lowercased headers first, then original casing)
-        try:
-            wh = Webhook(secret)
-            payload = wh.verify(raw_body, headers_dict)
-            print(
-                f"[4] VERIFY OK payload_type={payload.get('type', payload.get('event', 'unknown'))}",
-                file=sys.stderr, flush=True,
-            )
-        except WebhookVerificationError as e:
-            print(f"[4] VERIFY FAILED: {e}", file=sys.stderr, flush=True)
-            print(f"[4] VERIFY FAILED type: {type(e).__name__}", file=sys.stderr, flush=True)
-            # Casing fallback — in case the SDK is case-sensitive on the headers dict
-            try:
-                wh.verify(raw_body, dict(request.headers))
-                print("[4b] VERIFY with original casing OK", file=sys.stderr, flush=True)
-            except WebhookVerificationError as e2:
-                print(
-                    f"[4b] VERIFY with original casing also failed: {e2}",
-                    file=sys.stderr, flush=True,
-                )
+        # Checkpoint 4: 9-way HMAC discovery
+        if not verify_agentphone_webhook(raw_body, headers_dict, secret):
             raise HTTPException(status_code=401, detail="invalid signature")
-        except Exception as e:
-            print(
-                f"[4] UNEXPECTED EXCEPTION: {type(e).__name__}: {e}",
-                file=sys.stderr, flush=True,
-            )
-            raise
+        try:
+            payload = json.loads(raw_body)
+        except json.JSONDecodeError as e:
+            print(f"[4] JSON DECODE FAILED: {e}", file=sys.stderr, flush=True)
+            raise HTTPException(status_code=400, detail="invalid json")
+        print(
+            f"[4] PAYLOAD type={payload.get('type', payload.get('event', 'unknown'))}",
+            file=sys.stderr, flush=True,
+        )
 
         # ---- existing handler logic continues here -------------------------
         data = payload.get("data") or {}
