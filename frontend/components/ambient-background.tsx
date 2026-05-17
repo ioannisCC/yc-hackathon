@@ -1,7 +1,7 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { useMemo } from "react";
+import { useEffect, useState } from "react";
 import { cn } from "@/lib/utils";
 
 /**
@@ -70,9 +70,13 @@ function FallingPattern({
   durationSec: number;
   opacity: number;
 }) {
-  // density 0.5 → ~24 particles across the viewport
-  const count = Math.round(48 * density);
-  const particles = useMemo<Particle[]>(() => {
+  // density 0.5 → ~24 particles across the viewport.
+  // Generated AFTER mount only — Math.random() would cause an SSR/CSR
+  // hydration mismatch if we did it during render.
+  const [particles, setParticles] = useState<Particle[]>([]);
+
+  useEffect(() => {
+    const count = Math.round(48 * density);
     const arr: Particle[] = [];
     for (let i = 0; i < count; i++) {
       arr.push({
@@ -83,8 +87,8 @@ function FallingPattern({
         rotate: Math.random() * 360,
       });
     }
-    return arr;
-  }, [count, durationSec]);
+    setParticles(arr);
+  }, [density, durationSec]);
 
   return (
     <div className="absolute inset-0 z-[1]" style={{ opacity }}>
