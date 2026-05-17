@@ -1,0 +1,17 @@
+[project]
+name = "agentphone-outbound-mcp"
+version = "0.1.0"
+description = "MCP server: Claude Code triggers outbound agent-to-agent phone calls via the AI Receptionist backend."
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.0",
+    "httpx>=0.27",
+    "pydantic>=2.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
