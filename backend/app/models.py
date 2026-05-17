@@ -6,13 +6,18 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Column
+from sqlalchemy import Column, DateTime
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Field, SQLModel
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# All timestamps are stored as TIMESTAMPTZ. asyncpg refuses to bind a
+# tz-aware datetime to a tz-naive column, so every datetime column here
+# must carry sa_column=Column(DateTime(timezone=True), ...).
 
 
 class Business(SQLModel, table=True):
@@ -38,7 +43,10 @@ class Business(SQLModel, table=True):
         default_factory=dict, sa_column=Column(JSONB, nullable=False, default=dict)
     )
 
-    created_at: datetime = Field(default_factory=_utcnow)
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
 
 
 class CallLog(SQLModel, table=True):
@@ -49,8 +57,14 @@ class CallLog(SQLModel, table=True):
     caller_phone: str = Field(index=True)
     conversation_id: str | None = Field(default=None, index=True)
 
-    started_at: datetime = Field(default_factory=_utcnow)
-    ended_at: datetime | None = None
+    started_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+    ended_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), nullable=True),
+    )
     outcome: str | None = None  # booked | rescheduled | cancelled | info | escalated
 
     transcript: list[dict[str, Any]] = Field(
