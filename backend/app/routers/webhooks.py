@@ -215,11 +215,17 @@ async def _persist_turn(
     reply: str,
     tools_used: list[str],
 ) -> None:
+    """Incremental write: append caller + agent chunks, accumulate tool_calls,
+    keep status='in_progress' so the SSE stream stays open."""
     now = datetime.now(timezone.utc).isoformat()
-    new_turns = [
+    new_chunks: list[dict[str, Any]] = [
         {"role": "caller", "text": caller_text, "ts": now},
-        {"role": "agent", "text": reply, "ts": now, "tools": tools_used},
+        {"role": "agent", "text": reply, "ts": now},
     ]
+    new_tool_records: list[dict[str, Any]] = [
+        {"name": t, "ts": now} for t in tools_used
+    ]
+
     async with session_scope() as s:
         existing = None
         if conversation_id:
@@ -233,14 +239,18 @@ async def _persist_turn(
                 business_id=business_id,
                 caller_phone=caller_phone,
                 conversation_id=conversation_id,
-                transcript=new_turns,
-                tools_used=list(tools_used),
+                status="in_progress",
+                transcript=new_chunks,
+                tool_calls=new_tool_records,
+                tools_used=list(dict.fromkeys(tools_used)),
             )
             s.add(row)
         else:
-            existing.transcript = (existing.transcript or []) + new_turns
+            existing.transcript = (existing.transcript or []) + new_chunks
+            existing.tool_calls = (existing.tool_calls or []) + new_tool_records
             existing.tools_used = list(
                 dict.fromkeys((existing.tools_used or []) + tools_used)
             )
+            existing.status = "in_progress"
             s.add(existing)
         await s.commit()

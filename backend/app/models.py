@@ -15,29 +15,46 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-# All timestamps are stored as TIMESTAMPTZ. asyncpg refuses to bind a
-# tz-aware datetime to a tz-naive column, so every datetime column here
-# must carry sa_column=Column(DateTime(timezone=True), ...).
+# All timestamps are TIMESTAMPTZ — asyncpg refuses to bind tz-aware datetimes
+# to tz-naive columns. Every datetime field must carry the DateTime(timezone=True)
+# sa_column override.
+
+
+# Onboarding status shape stored in Business.onboarding_status:
+#   {
+#     "current_step": "scraping" | "moss" | "inbox" | "calcom" | "agent" | "live" | "done" | "failed",
+#     "completed_steps": ["scraping", ...],
+#     "error": null | {"step": "X", "message": "Y"}
+#   }
+def _initial_onboarding_status() -> dict[str, Any]:
+    return {"current_step": "scraping", "completed_steps": [], "error": None}
 
 
 class Business(SQLModel, table=True):
     __tablename__ = "businesses"
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
-    phone_number: str = Field(index=True, unique=True)
-    name: str
     website_url: str
-    maps_url: str | None = None
     timezone: str = "America/Los_Angeles"
+
+    # Filled in as onboarding progresses — null until the relevant step completes.
+    name: str | None = None
+    phone_number: str | None = Field(default=None, index=True, unique=True)
+    maps_url: str | None = None
+    moss_index_name: str | None = None
+    agentmail_inbox_id: str | None = None
+    agentphone_agent_id: str | None = None
+    agentphone_number_id: str | None = None
+    system_prompt: str | None = None
 
     cal_event_type_ids: list[int] = Field(
         default_factory=list, sa_column=Column(JSONB, nullable=False, default=list)
     )
-    moss_index_name: str
-    agentmail_inbox_id: str
-    agentphone_agent_id: str
-    agentphone_number_id: str
-    system_prompt: str
+
+    onboarding_status: dict[str, Any] = Field(
+        default_factory=_initial_onboarding_status,
+        sa_column=Column(JSONB, nullable=False, default=_initial_onboarding_status),
+    )
 
     extra: dict[str, Any] = Field(
         default_factory=dict, sa_column=Column(JSONB, nullable=False, default=dict)
@@ -55,7 +72,14 @@ class CallLog(SQLModel, table=True):
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     business_id: UUID = Field(foreign_key="businesses.id", index=True)
     caller_phone: str = Field(index=True)
+    caller_name: str | None = None
     conversation_id: str | None = Field(default=None, index=True)
+
+    # in_progress | completed | failed
+    status: str = Field(default="in_progress", index=True)
+    # booked | rescheduled | cancelled | info | escalated | none
+    outcome: str | None = None
+    summary: str | None = None
 
     started_at: datetime = Field(
         default_factory=_utcnow,
@@ -65,11 +89,16 @@ class CallLog(SQLModel, table=True):
         default=None,
         sa_column=Column(DateTime(timezone=True), nullable=True),
     )
-    outcome: str | None = None  # booked | rescheduled | cancelled | info | escalated
 
+    # Each chunk: {role: "caller"|"agent", text: str, ts: iso-string, tool_call?: {...}}
     transcript: list[dict[str, Any]] = Field(
         default_factory=list, sa_column=Column(JSONB, nullable=False, default=list)
     )
+    # Each tool call: {name, args, result, ts}
+    tool_calls: list[dict[str, Any]] = Field(
+        default_factory=list, sa_column=Column(JSONB, nullable=False, default=list)
+    )
+    # Compact list of tool names — useful for stats queries
     tools_used: list[str] = Field(
         default_factory=list, sa_column=Column(JSONB, nullable=False, default=list)
     )
