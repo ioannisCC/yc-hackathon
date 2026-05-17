@@ -2,7 +2,12 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { ApiError, onboardBusiness, type Business } from "@/lib/api";
+import {
+  ApiError,
+  fetchOnboardingStatus,
+  startOnboarding,
+  type OnboardingStatus,
+} from "@/lib/api";
 import type { Step } from "@/components/onboarding-step-card";
 
 export type Phase = "paste" | "running" | "done" | "error";
@@ -10,118 +15,158 @@ export type Phase = "paste" | "running" | "done" | "error";
 export type UseOnboardingResult = {
   phase: Phase;
   steps: Step[];
-  activeIndex: number; // index of the "active" step, or steps.length when done
-  business: Business | null;
+  activeIndex: number;
+  businessId: string | null;
+  failedStep: string | null;
   error: string | null;
   submit: (url: string) => void;
   reset: () => void;
 };
 
-/**
- * The backend POST is atomic — it runs all 6 steps then returns a Business.
- * We can't poll for intermediate state, so we drive the UI off a realistic
- * timer (durations sum to ~42s, matching observed onboarding latency) and
- * snap to "done" the moment the POST resolves. If the POST finishes early
- * we collapse remaining steps; if it's slow, the final step stays "active"
- * until the network completes.
- */
+/** Polls the backend's real /onboarding-status endpoint every 500ms while
+ *  the pipeline runs. Each step transition advances the 6-card UI in lockstep
+ *  with the actual backend state. */
 
-const STEP_BLUEPRINT: Array<Omit<Step, "status"> & { etaMs: number }> = [
-  { id: "scrape",   label: "Reading the business site",     service: "Browser Use", etaMs: 22_000 },
-  { id: "moss",     label: "Building knowledge index",      service: "Moss",        etaMs: 2_500 },
-  { id: "inbox",    label: "Setting up email inbox",        service: "AgentMail",   etaMs: 2_500 },
-  { id: "calcom",   label: "Wiring booking system",         service: "Cal.com",     etaMs: 5_500 },
-  { id: "agent",    label: "Provisioning AI agent + phone", service: "AgentPhone",  etaMs: 6_000 },
-  { id: "live",     label: "Live",                          service: "",            etaMs: 1_500 },
+// Maps backend step keys → UI step blueprint
+const BLUEPRINT: Array<Omit<Step, "status"> & { key: string }> = [
+  { key: "scraping", id: "scraping", label: "Reading the business site",     service: "Browser Use" },
+  { key: "moss",     id: "moss",     label: "Building knowledge index",      service: "Moss" },
+  { key: "inbox",    id: "inbox",    label: "Setting up email inbox",        service: "AgentMail" },
+  { key: "calcom",   id: "calcom",   label: "Wiring booking system",         service: "Cal.com" },
+  { key: "agent",    id: "agent",    label: "Provisioning AI agent + phone", service: "AgentPhone" },
+  { key: "live",     id: "live",     label: "Live",                          service: "" },
 ];
 
-const initialSteps = (): Step[] =>
-  STEP_BLUEPRINT.map((s) => ({
+const POLL_MS = 500;
+
+function initialSteps(): Step[] {
+  return BLUEPRINT.map((s) => ({
     id: s.id, label: s.label, service: s.service, status: "pending",
   }));
+}
+
+function stepsFromStatus(status: OnboardingStatus): { steps: Step[]; activeIndex: number } {
+  const completed = new Set(status.completed_steps);
+  const steps: Step[] = BLUEPRINT.map((b) => {
+    if (completed.has(b.key)) return { id: b.id, label: b.label, service: b.service, status: "done" };
+    if (b.key === status.current_step) return { id: b.id, label: b.label, service: b.service, status: "active" };
+    return { id: b.id, label: b.label, service: b.service, status: "pending" };
+  });
+  const activeIndex = BLUEPRINT.findIndex((b) => b.key === status.current_step);
+  return { steps, activeIndex: activeIndex < 0 ? steps.length : activeIndex };
+}
 
 export function useOnboarding(): UseOnboardingResult {
   const [phase, setPhase] = useState<Phase>("paste");
   const [steps, setSteps] = useState<Step[]>(initialSteps);
   const [activeIndex, setActiveIndex] = useState(0);
-  const [business, setBusiness] = useState<Business | null>(null);
+  const [businessId, setBusinessId] = useState<string | null>(null);
+  const [failedStep, setFailedStep] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const timersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancelledRef = useRef(false);
 
-  const clearTimers = useCallback(() => {
-    timersRef.current.forEach((t) => clearTimeout(t));
-    timersRef.current = [];
+  const stopPolling = useCallback(() => {
+    if (pollTimerRef.current) {
+      clearTimeout(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
   }, []);
 
-  useEffect(() => clearTimers, [clearTimers]);
+  useEffect(() => {
+    return () => {
+      cancelledRef.current = true;
+      stopPolling();
+    };
+  }, [stopPolling]);
 
   const reset = useCallback(() => {
-    clearTimers();
+    stopPolling();
     setPhase("paste");
     setSteps(initialSteps());
     setActiveIndex(0);
-    setBusiness(null);
+    setBusinessId(null);
+    setFailedStep(null);
     setError(null);
-  }, [clearTimers]);
+  }, [stopPolling]);
+
+  const poll = useCallback(
+    async (id: string): Promise<void> => {
+      if (cancelledRef.current) return;
+      try {
+        const status = await fetchOnboardingStatus(id);
+
+        if (status.current_step === "failed") {
+          stopPolling();
+          const stepKey = status.error?.step ?? "unknown";
+          const message = status.error?.message ?? "Onboarding failed";
+          setFailedStep(stepKey);
+          setError(message);
+          // Mark the failed step's UI card as "active" so the red treatment lands on it
+          const idx = BLUEPRINT.findIndex((b) => b.key === stepKey);
+          setSteps((cur) =>
+            cur.map((s, i) =>
+              i === idx ? { ...s, status: "active" } : s,
+            ),
+          );
+          setActiveIndex(idx < 0 ? 0 : idx);
+          setPhase("error");
+          return;
+        }
+
+        if (status.current_step === "done") {
+          stopPolling();
+          setSteps((cur) => cur.map((s) => ({ ...s, status: "done" })));
+          setActiveIndex(BLUEPRINT.length);
+          setPhase("done");
+          return;
+        }
+
+        const { steps: nextSteps, activeIndex: nextActive } = stepsFromStatus(status);
+        setSteps(nextSteps);
+        setActiveIndex(nextActive);
+
+        pollTimerRef.current = setTimeout(() => void poll(id), POLL_MS);
+      } catch (e) {
+        // Transient — retry with a slight backoff. Hard error after many failures.
+        pollTimerRef.current = setTimeout(() => void poll(id), POLL_MS * 4);
+      }
+    },
+    [stopPolling],
+  );
 
   const submit = useCallback(
-    (url: string) => {
-      clearTimers();
+    async (url: string) => {
+      stopPolling();
       setPhase("running");
       setError(null);
-      setBusiness(null);
+      setFailedStep(null);
       setSteps(initialSteps());
       setActiveIndex(0);
 
       // Step 0 starts active immediately
       setSteps((cur) => cur.map((s, i) => (i === 0 ? { ...s, status: "active" } : s)));
 
-      // Schedule transitions for steps 0..N-2 (the final "Live" step is
-      // gated on the POST response).
-      let cumulative = 0;
-      for (let i = 0; i < STEP_BLUEPRINT.length - 1; i++) {
-        const blueprint = STEP_BLUEPRINT[i]!;
-        cumulative += blueprint.etaMs;
-        const t = setTimeout(() => {
-          setSteps((cur) =>
-            cur.map((s, idx) => {
-              if (idx === i) return { ...s, status: "done" };
-              if (idx === i + 1) return { ...s, status: "active" };
-              return s;
-            }),
-          );
-          setActiveIndex(i + 1);
-        }, cumulative);
-        timersRef.current.push(t);
+      try {
+        const { id } = await startOnboarding(url);
+        setBusinessId(id);
+        void poll(id);
+      } catch (e: unknown) {
+        let msg = "Couldn't reach the backend";
+        if (e instanceof ApiError) {
+          msg = typeof e.detail === "object" && e.detail
+            ? JSON.stringify(e.detail).slice(0, 240)
+            : `Backend ${e.status}`;
+        } else if (e instanceof Error) {
+          msg = e.message;
+        }
+        setError(msg);
+        setPhase("error");
       }
-
-      // Fire the actual POST
-      onboardBusiness(url)
-        .then((biz) => {
-          clearTimers();
-          setBusiness(biz);
-          setSteps((cur) => cur.map((s) => ({ ...s, status: "done" })));
-          setActiveIndex(STEP_BLUEPRINT.length);
-          setPhase("done");
-        })
-        .catch((e: unknown) => {
-          clearTimers();
-          let msg = "Something went wrong";
-          if (e instanceof ApiError) {
-            msg =
-              typeof e.detail === "object" && e.detail
-                ? JSON.stringify(e.detail).slice(0, 240)
-                : `Backend ${e.status}`;
-          } else if (e instanceof Error) {
-            msg = e.message;
-          }
-          setError(msg);
-          setPhase("error");
-        });
     },
-    [clearTimers],
+    [stopPolling, poll],
   );
 
-  return { phase, steps, activeIndex, business, error, submit, reset };
+  return { phase, steps, activeIndex, businessId, failedStep, error, submit, reset };
 }

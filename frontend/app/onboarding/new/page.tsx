@@ -1,7 +1,7 @@
 "use client";
 
 import { AnimatePresence, motion } from "framer-motion";
-import { ArrowRight } from "lucide-react";
+import { ArrowRight, RotateCcw } from "lucide-react";
 import { useRouter } from "next/navigation";
 import {
   useCallback,
@@ -16,12 +16,14 @@ import { LiquidButton } from "@/components/liquid-button";
 import { LiquidInput } from "@/components/liquid-input";
 import { OnboardingStepCard } from "@/components/onboarding-step-card";
 import { useOnboarding } from "@/hooks/use-onboarding";
+import { cn } from "@/lib/utils";
 
 const EASE = [0.22, 1, 0.36, 1] as const;
 
 export default function OnboardingNewPage() {
   const router = useRouter();
-  const { phase, steps, activeIndex, business, error, submit } = useOnboarding();
+  const { phase, steps, activeIndex, businessId, failedStep, error, submit, reset } =
+    useOnboarding();
 
   const [expanded, setExpanded] = useState(false);
   const [url, setUrl] = useState("");
@@ -29,7 +31,6 @@ export default function OnboardingNewPage() {
   const inputRef = useRef<HTMLInputElement>(null);
   const cardsRef = useRef<HTMLDivElement>(null);
 
-  // Focus the input the moment the island expands
   useEffect(() => {
     if (expanded) {
       const t = setTimeout(() => inputRef.current?.focus(), 220);
@@ -37,15 +38,15 @@ export default function OnboardingNewPage() {
     }
   }, [expanded]);
 
-  // Route to the live page after the POST resolves
+  // After backend reports status="done", route to /onboarding/{id}
   useEffect(() => {
-    if (phase === "done" && business) {
-      const t = setTimeout(() => router.push(`/onboarding/${business.id}`), 900);
+    if (phase === "done" && businessId) {
+      const t = setTimeout(() => router.push(`/onboarding/${businessId}`), 900);
       return () => clearTimeout(t);
     }
-  }, [phase, business, router]);
+  }, [phase, businessId, router]);
 
-  // Autoscroll the active step into the centered viewport
+  // Autoscroll the active card to viewport-center
   useEffect(() => {
     if (phase !== "running") return;
     const target = cardsRef.current?.querySelector<HTMLElement>(
@@ -76,6 +77,11 @@ export default function OnboardingNewPage() {
     [url, submit],
   );
 
+  const handleRetry = useCallback(() => {
+    reset();
+    setExpanded(true);
+  }, [reset]);
+
   const islandMode: "collapsed" | "expanded" | "status" =
     phase === "paste"
       ? expanded
@@ -87,7 +93,7 @@ export default function OnboardingNewPage() {
 
   return (
     <main className="relative mx-auto flex min-h-screen w-full max-w-3xl flex-col items-center px-4 pt-[18vh] pb-24 sm:px-6 sm:pt-[22vh]">
-      {/* HERO COPY — only while in paste state */}
+      {/* Hero copy — only in paste state */}
       <AnimatePresence mode="wait">
         {phase === "paste" && (
           <motion.div
@@ -109,7 +115,7 @@ export default function OnboardingNewPage() {
         )}
       </AnimatePresence>
 
-      {/* THE ISLAND */}
+      {/* Dynamic Island */}
       <div className="w-full">
         <DynamicIsland mode={islandMode}>
           {islandMode === "collapsed" && (
@@ -148,9 +154,16 @@ export default function OnboardingNewPage() {
 
           {islandMode === "status" && currentStep && (
             <div className="flex w-full items-center gap-2.5 sm:gap-3 text-xs sm:text-sm">
-              <span className="inline-flex h-2 w-2 shrink-0 animate-pulse rounded-full bg-cyan-300 shadow-[0_0_12px_rgba(34,211,238,0.9)]" />
+              <span
+                className={cn(
+                  "inline-flex h-2 w-2 shrink-0 rounded-full",
+                  phase === "error"
+                    ? "bg-red-400 shadow-[0_0_12px_rgba(248,113,113,0.9)]"
+                    : "animate-pulse bg-cyan-300 shadow-[0_0_12px_rgba(34,211,238,0.9)]",
+                )}
+              />
               <span className="truncate font-medium tracking-tight text-white">
-                {currentStep.label}
+                {phase === "error" ? `Failed at ${failedStep ?? "step"}` : currentStep.label}
               </span>
               <span className="ml-auto shrink-0 font-mono text-[10px] sm:text-xs text-white/40">
                 {Math.min(activeIndex + 1, steps.length)} / {steps.length}
@@ -159,25 +172,34 @@ export default function OnboardingNewPage() {
           )}
         </DynamicIsland>
 
-        {/* Inline error under the island */}
+        {/* Inline error + retry */}
         <AnimatePresence>
           {phase === "error" && error && (
-            <motion.p
+            <motion.div
               initial={{ opacity: 0, y: -4 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0 }}
               transition={{ duration: 0.4 }}
-              className="mt-4 text-center text-xs sm:text-sm font-normal tracking-normal text-red-400/90"
+              className="mt-4 flex flex-col items-center gap-3"
             >
-              {error}
-            </motion.p>
+              <p className="max-w-md text-center text-xs font-normal tracking-normal text-red-400/90 sm:text-sm">
+                {error}
+              </p>
+              <button
+                onClick={handleRetry}
+                className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium tracking-wide text-white/75 backdrop-blur-md transition-colors hover:border-white/20 hover:bg-white/[0.08] hover:text-white"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                Try again
+              </button>
+            </motion.div>
           )}
         </AnimatePresence>
       </div>
 
-      {/* STEP CARDS — appear during running / done */}
+      {/* Step cards */}
       <AnimatePresence>
-        {(phase === "running" || phase === "done") && (
+        {(phase === "running" || phase === "done" || phase === "error") && (
           <motion.div
             ref={cardsRef}
             initial={{ opacity: 0 }}
@@ -186,14 +208,26 @@ export default function OnboardingNewPage() {
             transition={{ duration: 0.5, ease: EASE }}
             className="mt-12 flex w-full max-w-xl flex-col gap-2.5 sm:mt-16 sm:gap-3"
           >
-            {steps.map((step, i) => (
-              <OnboardingStepCard
-                key={step.id}
-                step={step}
-                index={i}
-                isCurrent={i === activeIndex && phase === "running"}
-              />
-            ))}
+            {steps.map((step, i) => {
+              const isFailedCard =
+                phase === "error" && (failedStep === step.id || (failedStep === null && step.status === "active"));
+              return (
+                <div
+                  key={step.id}
+                  className={cn(
+                    "rounded-2xl transition-shadow",
+                    isFailedCard &&
+                      "ring-1 ring-red-400/40 shadow-[0_0_36px_rgba(248,113,113,0.18)]",
+                  )}
+                >
+                  <OnboardingStepCard
+                    step={step}
+                    index={i}
+                    isCurrent={i === activeIndex && phase === "running"}
+                  />
+                </div>
+              );
+            })}
           </motion.div>
         )}
       </AnimatePresence>
