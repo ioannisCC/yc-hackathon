@@ -1,6 +1,7 @@
 """Application configuration loaded from .env via pydantic-settings."""
 from __future__ import annotations
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -40,6 +41,13 @@ class Settings(BaseSettings):
 
     # Public URL for AgentPhone webhook (filled after ngrok/cloudflared starts)
     PUBLIC_BACKEND_URL: str = "http://localhost:8000"
+
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def _ensure_asyncpg(cls, v: str) -> str:
+        if v.startswith("postgresql://"):
+            v = v.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return v
 
 
 settings = Settings()
