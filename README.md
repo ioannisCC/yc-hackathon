@@ -33,7 +33,7 @@ All 8 must print **PASS**. The smoke test never spends money.
 | `ANTHROPIC_API_KEY` | Claude Haiku 4.5 (voice brain) |
 | `GEMINI_API_KEY` | Gemini 2.5 Flash (optional sponsor loader) |
 | `AGENTPHONE_API_KEY` | AgentPhone (voice + numbers) |
-| `AGENTPHONE_WEBHOOK_SECRET` | from `client.webhooks.set(...)` after first run |
+| `AGENTPHONE_WEBHOOK_SECRET` | run `rotate_account_webhook_secret()` once manually, paste the output. Never auto-run on boot — it rotates every call. |
 | `MOSS_PROJECT_ID` + `MOSS_PROJECT_KEY` | Moss (per-business knowledge index) |
 | `SUPERMEMORY_API_KEY` | Supermemory (per-caller memory) |
 | `AGENTMAIL_API_KEY` | AgentMail (inbox per business) |

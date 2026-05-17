@@ -28,10 +28,19 @@ class ProvisionResult:
     phone_number: str
 
 
-async def ensure_account_webhook() -> str:
-    """Idempotently set the account-level webhook URL and return the secret.
+async def rotate_account_webhook_secret() -> str:
+    """MANUAL OPERATION ONLY. Sets the account-level webhook URL and returns
+    the new secret.
 
-    Caller should paste the returned secret into AGENTPHONE_WEBHOOK_SECRET in .env.
+    AgentPhone's webhooks.set ALWAYS regenerates the secret — there is no
+    no-op "ensure" variant. Calling this on every app boot would rotate the
+    secret on every Railway redeploy and instantly invalidate the
+    AGENTPHONE_WEBHOOK_SECRET in .env, breaking signature verification on
+    the very next call.
+
+    Run this once from a shell when bootstrapping or rotating, paste the
+    returned value into .env, and redeploy. Never wire it into lifespan
+    or any auto-run code path.
     """
     if not settings.PUBLIC_BACKEND_URL:
         raise RuntimeError("PUBLIC_BACKEND_URL must be set before configuring webhook")
@@ -40,7 +49,7 @@ async def ensure_account_webhook() -> str:
     secret = getattr(webhook, "secret", "")
     if secret and secret != settings.AGENTPHONE_WEBHOOK_SECRET:
         log.warning(
-            "AgentPhone webhook secret changed. Update .env AGENTPHONE_WEBHOOK_SECRET=%s",
+            "AgentPhone webhook secret rotated. Paste into .env AGENTPHONE_WEBHOOK_SECRET=%s",
             secret,
         )
     return secret
