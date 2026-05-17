@@ -106,8 +106,42 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 async def lookup_business_info(
     business: Business, _caller: str, query: str
 ) -> dict[str, Any]:
-    hits = await moss_svc.query(business.moss_index_name, query)
-    return {"results": hits}
+    # Prefer semantic via Moss if this business has an index
+    if business.moss_index_name:
+        try:
+            result = await moss_svc.query(business.moss_index_name, query)
+            snippets = [d.get("text", "") for d in (result.get("docs") or []) if d.get("text")]
+            if snippets:
+                return {"results": snippets, "source": "moss"}
+        except Exception as e:
+            log_call_event(
+                business.id, "tool:lookup_business_info", "moss_fallback",
+                {"err": str(e)},
+            )
+    # Fallback: keyword scan over the BusinessInfo JSON stored at onboarding
+    return {"results": _scan_extra(business.extra, query), "source": "in-memory"}
+
+
+def _scan_extra(extra: dict[str, Any], q: str) -> list[str]:
+    scraped = extra.get("scraped") or {}
+    needles = [t for t in q.lower().split() if len(t) > 2]
+    chunks: list[str] = []
+    if scraped.get("description"):
+        chunks.append(str(scraped["description"]))
+    if scraped.get("booking_policy"):
+        chunks.append(f"Booking policy: {scraped['booking_policy']}")
+    for d, h in (scraped.get("hours") or {}).items():
+        chunks.append(f"{d}: {h}")
+    for s in (scraped.get("services") or []):
+        line = s.get("name", "")
+        if s.get("duration_minutes"):
+            line += f" — {s['duration_minutes']} min"
+        if s.get("price_usd") is not None:
+            line += f" — ${s['price_usd']:g}"
+        chunks.append(line)
+    if not needles:
+        return chunks[:5]
+    return [c for c in chunks if any(n in c.lower() for n in needles)][:5]
 
 
 def _pick_event_type(business: Business, service_name: str) -> int:

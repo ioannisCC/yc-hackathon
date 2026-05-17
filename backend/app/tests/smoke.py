@@ -50,36 +50,13 @@ async def check_anthropic() -> str:
 
 
 async def check_moss() -> str:
-    from moss import DocumentInfo, MossClient, QueryOptions
+    from app.services import moss_svc
 
-    client = MossClient(
-        project_id=settings.MOSS_PROJECT_ID,
-        project_key=settings.MOSS_PROJECT_KEY,
-    )
-    index_name = f"smoke_test_{int(time.time())}"
-
-    try:
-        await client.create_index(
-            index_name,
-            [
-                DocumentInfo(id="1", text="The receptionist is friendly."),
-                DocumentInfo(id="2", text="Bookings are confirmed by email."),
-            ],
-            model_id="moss-minilm",
-        )
-        await client.load_index(index_name)
-        results = await client.query(
-            index_name,
-            "how are bookings confirmed?",
-            QueryOptions(top_k=1),
-        )
-        top_id = results.docs[0].id if results.docs else "none"
-        return f"index={index_name} top_doc_id={top_id}"
-    finally:
-        try:
-            await client.delete_index(index_name)
-        except Exception:
-            pass
+    info = await moss_svc.validate_credentials()
+    sdk = "sdk" if moss_svc.HAS_SDK else "rest-only"
+    project = info.get("projectName", "?")
+    indexes = info.get("usage", {}).get("indexes", "?")
+    return f"project={project!r} indexes={indexes} mode={sdk}"
 
 
 async def check_supermemory() -> str:

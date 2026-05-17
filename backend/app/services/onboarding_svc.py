@@ -5,7 +5,6 @@ import asyncio
 import time
 from uuid import uuid4
 
-from moss import DocumentInfo
 from sqlmodel import select
 
 from app.agent.system_prompt import build_system_prompt
@@ -41,8 +40,8 @@ async def _step(business_id, step_name: str, coro):
         raise OnboardingError(step_name, e) from e
 
 
-def _docs_from_business(info: browser_svc.BusinessInfo) -> list[DocumentInfo]:
-    docs: list[DocumentInfo] = []
+def _docs_from_business(info: browser_svc.BusinessInfo) -> list[dict[str, str]]:
+    docs: list[dict[str, str]] = []
     for s in info.services:
         bits = [s.name]
         if s.duration_minutes:
@@ -50,16 +49,16 @@ def _docs_from_business(info: browser_svc.BusinessInfo) -> list[DocumentInfo]:
         if s.price_usd is not None:
             bits.append(f"${s.price_usd:g}")
         slug = s.name.lower().replace(" ", "_")[:32]
-        docs.append(DocumentInfo(id=f"svc_{slug}", text=" — ".join(bits)))
+        docs.append({"id": f"svc_{slug}", "text": " — ".join(bits)})
     if info.hours:
         hours_text = "Hours: " + ", ".join(f"{d}: {h}" for d, h in info.hours.items())
-        docs.append(DocumentInfo(id="hours", text=hours_text))
+        docs.append({"id": "hours", "text": hours_text})
     if info.booking_policy:
-        docs.append(DocumentInfo(id="policy", text=f"Booking policy: {info.booking_policy}"))
+        docs.append({"id": "policy", "text": f"Booking policy: {info.booking_policy}"})
     if info.description:
-        docs.append(DocumentInfo(id="about", text=info.description))
+        docs.append({"id": "about", "text": info.description})
     if not docs:
-        docs.append(DocumentInfo(id="about", text=info.name))
+        docs.append({"id": "about", "text": info.name})
     return docs
 
 
@@ -76,12 +75,22 @@ async def onboard_business(url: str) -> Business:
         business_id, "browser_scrape", browser_svc.extract_business(url)
     )
 
-    # STEP 2 — Moss index
+    # STEP 2 — Moss index (skipped gracefully if SDK unavailable on this host)
     index_name = f"biz_{short}"
-    await _step(
-        business_id, "moss_index",
-        moss_svc.create_business_index(index_name, _docs_from_business(info)),
-    )
+    try:
+        await _step(
+            business_id, "moss_index",
+            moss_svc.create_business_index(index_name, _docs_from_business(info)),
+        )
+    except OnboardingError as e:
+        if isinstance(e.cause, NotImplementedError):
+            log_call_event(
+                business_id, "system", "moss_index_skipped",
+                {"reason": str(e.cause)},
+            )
+            index_name = ""
+        else:
+            raise
 
     # STEP 3 — AgentMail inbox
     inbox_id: str = await _step(
