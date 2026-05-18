@@ -115,6 +115,25 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "required": ["reason"],
         },
     },
+    {
+        "name": "send_email",
+        "description": (
+            "Send a custom email FROM the business's inbox to the caller (or "
+            "another recipient). Use ONLY when you need to send a custom email "
+            "beyond Cal.com's automatic booking confirmation — e.g. follow-up "
+            "notes, custom messages, escalations. Never use this to send a "
+            "booking confirmation; book_appointment already does that."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "to_email": {"type": "string", "description": "Recipient email address."},
+                "subject": {"type": "string"},
+                "body": {"type": "string", "description": "Plain-text email body."},
+            },
+            "required": ["to_email", "subject", "body"],
+        },
+    },
 ]
 
 
@@ -304,6 +323,45 @@ async def escalate_to_human(
     return {"status": "transfer initiated"}
 
 
+async def send_email(
+    business: Business,
+    _caller: str,
+    to_email: str,
+    subject: str,
+    body: str,
+    **_call_kwargs: Any,
+) -> dict[str, Any]:
+    """Send an email FROM the business's AgentMail inbox to the recipient.
+
+    Returns {ok, message_id, error?}. The brain treats {ok: false} as a
+    transient failure and decides on a recovery path — usually just
+    apologizing to the caller; we don't auto-retry."""
+    if not business.agentmail_inbox_id:
+        return {
+            "ok": False,
+            "error": "business has no agentmail inbox provisioned",
+        }
+    try:
+        message_id = await mail_svc.send_email(
+            business.agentmail_inbox_id,
+            to=to_email,
+            subject=subject,
+            text=body,
+        )
+    except Exception as e:
+        log_call_event(
+            business.id, "tool:send_email", "send_failed",
+            {"to": to_email, "err": f"{type(e).__name__}: {e}"},
+        )
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    log_call_event(
+        business.id, "tool:send_email", "sent",
+        {"to": to_email, "subject": subject, "message_id": message_id},
+    )
+    return {"ok": True, "message_id": message_id}
+
+
 async def end_call(
     _business: Business, _caller: str, farewell_message: str = "",
     **_call_kwargs: Any,
@@ -324,6 +382,7 @@ DISPATCH: dict[str, ToolHandler] = {
     "recall_caller": recall_caller,
     "remember_about_caller": remember_about_caller,
     "escalate_to_human": escalate_to_human,
+    "send_email": send_email,
     "end_call": end_call,
 }
 
