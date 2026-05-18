@@ -41,11 +41,17 @@ try:
     from moss import QueryOptions as _SDKQueryOptions  # type: ignore[import-not-found]
 
     HAS_SDK = True
-except ImportError:
+except ImportError as _moss_import_err:
     HAS_SDK = False
     _SDKDocumentInfo = None  # type: ignore[assignment]
     _SDKMossClient = None  # type: ignore[assignment]
     _SDKQueryOptions = None  # type: ignore[assignment]
+    # Surface the actual error so a Railway build that lost the wheel is
+    # diagnosable from a single log line, not from "why is lookup_business_info
+    # falling back to escalate_to_human in prod but not locally?"
+    log.warning(
+        "Moss SDK not available, will use REST fallback: %s", _moss_import_err,
+    )
 
 _sdk_client: Any = None
 

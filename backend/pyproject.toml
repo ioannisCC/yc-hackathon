@@ -19,6 +19,7 @@ dependencies = [
     "supermemory",
     "agentmail",
     "browser-use-sdk",
+    "moss>=1.1.0",
 ]
 
 [build-system]
