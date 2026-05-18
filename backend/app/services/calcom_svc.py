@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from datetime import datetime, timezone as dt_timezone
 from typing import Any
 
 import httpx
@@ -51,6 +52,20 @@ def _client() -> httpx.AsyncClient:
 
 def _slugify(s: str) -> str:
     return re.sub(r"[^a-z0-9-]+", "-", s.lower()).strip("-")[:80]
+
+
+def _to_utc_z(iso: str) -> str:
+    """Normalize any ISO 8601 datetime to UTC `YYYY-MM-DDTHH:MM:SS.000Z`.
+
+    Cal.com v2 /bookings rejects offsets like `-07:00` even when they
+    represent the same instant — it wants the literal `.000Z` form. We
+    accept anything `datetime.fromisoformat` understands (trailing `Z`,
+    explicit `+00:00`, signed offsets, or naive). Naive values are
+    treated as already-UTC."""
+    dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=dt_timezone.utc)
+    return dt.astimezone(dt_timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
 async def get_me() -> dict[str, Any]:
@@ -142,11 +157,12 @@ async def create_booking(
 ) -> dict[str, Any]:
     body = {
         "eventTypeId": event_type_id,
-        "start": start_iso,
+        "start": _to_utc_z(start_iso),
         "attendee": {
             "name": attendee_name,
             "email": attendee_email,
             "timeZone": timezone,
+            "language": "en",
         },
     }
     r = await _client().post(
@@ -163,7 +179,7 @@ async def reschedule_booking(
 ) -> dict[str, Any]:
     r = await _client().post(
         f"/bookings/{booking_uid}/reschedule",
-        json={"start": new_start_iso, "reschedulingReason": reason},
+        json={"start": _to_utc_z(new_start_iso), "reschedulingReason": reason},
         headers={"cal-api-version": BOOKINGS_API_VERSION},
     )
     r.raise_for_status()
