@@ -13,7 +13,18 @@ from app.config import settings
 log = logging.getLogger(__name__)
 
 _BASE = "https://api.cal.com/v2"
-_VERSION = "2024-08-13"
+
+# Cal.com versions endpoints SEPARATELY. Passing the wrong cal-api-version
+# for a given path silently routes to a stale handler and returns 404 / wrong
+# schema. Verified live (May 2026):
+#   /event-types     → 2024-06-14
+#   /bookings/*      → 2024-08-13
+#   /slots           → 2024-09-04 (older versions 404)
+# Every call below sets its version via headers= override.
+EVENT_TYPES_API_VERSION = "2024-06-14"
+BOOKINGS_API_VERSION = "2024-08-13"
+SLOTS_API_VERSION = "2024-09-04"
+
 # Cal.com event-type creates are 1-3s each but burst-slow under load when
 # many businesses onboard in parallel — give it plenty of headroom.
 _TIMEOUT = httpx.Timeout(30.0, connect=10.0)
@@ -29,7 +40,9 @@ def _client() -> httpx.AsyncClient:
             timeout=_TIMEOUT,
             headers={
                 "Authorization": f"Bearer {settings.CALCOM_API_KEY}",
-                "cal-api-version": _VERSION,
+                # Reasonable default for endpoints that don't override
+                # (e.g. /me). Path-specific versions are passed per call.
+                "cal-api-version": BOOKINGS_API_VERSION,
                 "Content-Type": "application/json",
             },
         )
@@ -54,8 +67,8 @@ async def create_event_type(
 ) -> int:
     """Create a per-service event type tagged with business_id metadata.
 
-    Cal.com versions endpoints separately: event-types REQUIRES 2024-06-14,
-    not the 2024-08-13 we use for bookings/slots. Wrong version → 404.
+    Cal.com versions endpoints separately — see EVENT_TYPES_API_VERSION.
+    Wrong version → 404.
 
     Single retry with 1s backoff on ReadTimeout or 5xx — 4xx is a client
     bug (bad slug, dupe title) and is not worth retrying."""
@@ -66,7 +79,7 @@ async def create_event_type(
         "lengthInMinutes": duration_minutes,
         "metadata": {"business_id": business_id, "service_name": service_name},
     }
-    extra_headers = {"cal-api-version": "2024-06-14"}
+    extra_headers = {"cal-api-version": EVENT_TYPES_API_VERSION}
 
     for attempt in (1, 2):
         try:
@@ -103,6 +116,7 @@ async def get_availability(
             "start": start_iso,
             "end": end_iso,
         },
+        headers={"cal-api-version": SLOTS_API_VERSION},
     )
     r.raise_for_status()
     payload = r.json().get("data", {})
@@ -135,7 +149,11 @@ async def create_booking(
             "timeZone": timezone,
         },
     }
-    r = await _client().post("/bookings", json=body)
+    r = await _client().post(
+        "/bookings",
+        json=body,
+        headers={"cal-api-version": BOOKINGS_API_VERSION},
+    )
     r.raise_for_status()
     return r.json().get("data", r.json())
 
@@ -146,6 +164,7 @@ async def reschedule_booking(
     r = await _client().post(
         f"/bookings/{booking_uid}/reschedule",
         json={"start": new_start_iso, "reschedulingReason": reason},
+        headers={"cal-api-version": BOOKINGS_API_VERSION},
     )
     r.raise_for_status()
     return r.json().get("data", r.json())
@@ -157,6 +176,7 @@ async def cancel_booking(
     r = await _client().post(
         f"/bookings/{booking_uid}/cancel",
         json={"cancellationReason": reason},
+        headers={"cal-api-version": BOOKINGS_API_VERSION},
     )
     r.raise_for_status()
     return r.json().get("data", r.json())
@@ -164,7 +184,11 @@ async def cancel_booking(
 
 async def list_bookings_for_business(business_id: str) -> list[dict[str, Any]]:
     """Filter Cal.com bookings by metadata.business_id."""
-    r = await _client().get("/bookings", params={"take": 100})
+    r = await _client().get(
+        "/bookings",
+        params={"take": 100},
+        headers={"cal-api-version": BOOKINGS_API_VERSION},
+    )
     r.raise_for_status()
     rows = r.json().get("data", [])
     out: list[dict[str, Any]] = []
