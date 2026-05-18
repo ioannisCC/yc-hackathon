@@ -19,8 +19,15 @@ dependencies = [
     "supermemory",
     "agentmail",
     "browser-use-sdk",
-    "moss>=1.1.0",
 ]
+
+# Moss SDK is local-only: it depends on inferedge-moss-core 0.11.0, which
+# is not published on PyPI for Linux (only 0.1.0-0.4.1 available as of
+# 2026-05-18), so the Railway build cannot resolve it. Install on Mac with
+# `uv sync --extra local` to seed Moss indexes; production keeps the REST
+# fallback path in moss_svc. See HANDOFF_NOTES.md for the full story.
+[project.optional-dependencies]
+local = ["moss>=1.1.0"]
 
 [build-system]
 requires = ["hatchling"]
