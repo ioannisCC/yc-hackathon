@@ -19,7 +19,48 @@ from app.models import Business
 log = logging.getLogger(__name__)
 
 _MODEL = "claude-haiku-4-5-20251001"
-_MAX_TOKENS = 1024
+# The dynamic part needs to fit roughly 700 chars so the full prompt
+# (dynamic + 1208-char principles) stays well under 2000 chars. Capping
+# max_tokens here is belt-and-braces in case Haiku ignores the explicit
+# char limit in the meta-prompt.
+_MAX_TOKENS = 300
+_DYNAMIC_CHAR_BUDGET = 700
+
+
+# Anti-drift principles appended verbatim to every synthesized prompt.
+# These are non-negotiable, so we keep them in Python rather than asking
+# Haiku to reproduce them every time. Empirically, when call-handling
+# rules are left to the meta-LLM, it paraphrases or drops bullets —
+# both of which have triggered the dup-booking + overstaying-the-call
+# failure modes on stage. Hard-coding the principles fixes that.
+_ANTI_DRIFT_PRINCIPLES = """\
+HOW YOU HANDLE THE CALL
+
+You're calling on someone's behalf — be warm but direct, like a thoughtful \
+personal assistant. One or two sentences per turn. State who you are and \
+what you need up front. When the receiving agent asks for details, give \
+them straight from your context. If asked for something not in your \
+context, say "I'll have to check with [name] on that" — never invent.
+
+WHEN THE GOAL IS DONE, END THE CALL
+
+The moment the receiver confirms the booking ("you're booked", \
+"confirmation sent", "you're all set", "I'll send the email"), you're \
+done. Say a quick "thanks, have a great day" and invoke end_call in the \
+same turn. Don't re-confirm, don't ask follow-ups, don't engage further. \
+The longer you stay on the line after success, the more room for the \
+conversation to drift.
+
+If 4+ turns pass without forward progress (receiver looping, agent \
+confusion, tools failing), wrap up politely: "I'll have to call back, \
+thanks for your time" + end_call.
+
+Phone audio is noisy. If the receiver's words don't make sense, ask once \
+to clarify. If still unclear, advance with what you have or end_call.
+
+Don't repeat yourself. If you're about to say the same thing twice — stop \
+and either advance or end."""
+
 
 _META_PROMPT = """You are a prompt engineer. Generate a SYSTEM PROMPT for a voice
 AI agent that will place a phone call on behalf of a human (their name and
@@ -27,7 +68,8 @@ relevant facts are in CALLER_CONTEXT). The agent will speak with ANOTHER AI
 receptionist on the line. Two AI agents, agent-to-agent.
 
 Output ONLY the system prompt body — no preamble, no markdown headings, no
-code fences. The prompt must:
+code fences. Keep it VERY brief — STRICT MAXIMUM 700 characters. Aim for
+4-6 short sentences total. The prompt must:
 
 1. Open with the agent's identity and that it is calling on behalf of the
    caller. Use the caller's name from CALLER_CONTEXT if present.
@@ -35,25 +77,22 @@ code fences. The prompt must:
    the purpose of the call within the first turn.
 3. Bake every key from CALLER_CONTEXT into the prompt as a fact the agent
    can volunteer when asked. Do not invent facts that aren't present.
-4. Tell the agent it is on a live phone call talking to another AI:
-   - keep replies short and conversational (one or two sentences per turn)
-   - skip pleasantries, get to the point
-   - answer the receptionist's questions directly from CALLER_CONTEXT
-   - if the receptionist asks for something not in CALLER_CONTEXT, say so
-     honestly rather than fabricating
-5. Tell the agent that the RECEIVING agent is the one with booking tools.
-   The caller's job is purely to provide info and confirm the booking.
-6. End-of-call protocol: When the booking is confirmed (or you're told it's
-   not possible), say a brief warm farewell and invoke the end_call tool in
-   the SAME turn. Do not stay on the line after the goal is achieved.
-7. List the single tool the agent has: end_call(farewell_message).
+4. Mention that the RECEIVING agent owns the booking tools — the caller's
+   job is to provide info and confirm.
+5. Mention the single tool the agent has: end_call(farewell_message).
 
 The TARGET business info is provided so the agent can reference it by name
 ("Hi, I'm calling Code Salon to book a haircut..."). Do not let the agent
 quote prices/hours of the target — that's the receptionist's job.
 
-CALLER_CONTEXT and TARGET and INTENT are below. Return only the system
-prompt body."""
+IMPORTANT: Do NOT include call-handling rules, end-of-call protocol,
+brevity rules, drift-handling, or "HOW YOU HANDLE" / "WHEN THE GOAL IS
+DONE" sections — these are appended verbatim AFTER your output and must
+not be duplicated or paraphrased. Focus only on identity, intent, facts,
+and tool list.
+
+CALLER_CONTEXT and TARGET and INTENT are below. Return only the dynamic
+system prompt body."""
 
 
 _client: AsyncAnthropic | None = None
@@ -96,12 +135,27 @@ async def generate_outbound_system_prompt(
         system=_META_PROMPT,
         messages=[{"role": "user", "content": user_block}],
     )
-    text = "".join(
+    dynamic_part = "".join(
         getattr(b, "text", "") for b in resp.content if getattr(b, "type", "") == "text"
     ).strip()
-    if not text:
+    if not dynamic_part:
         raise RuntimeError("outbound prompt synthesis returned empty text")
-    return text
+
+    # Defensive: if Haiku ignored the explicit char budget, trim on a
+    # sentence boundary so the total fits inside _TOTAL_PROMPT_BUDGET. The
+    # principles must always survive verbatim.
+    if len(dynamic_part) > _DYNAMIC_CHAR_BUDGET:
+        log.warning(
+            "synthesized dynamic part %d chars > budget %d — truncating",
+            len(dynamic_part), _DYNAMIC_CHAR_BUDGET,
+        )
+        truncated = dynamic_part[:_DYNAMIC_CHAR_BUDGET]
+        last_period = truncated.rfind(". ")
+        dynamic_part = truncated[: last_period + 1] if last_period > 0 else truncated
+
+    # Append the anti-drift principles verbatim. They're guaranteed to be
+    # present in the final prompt regardless of what Haiku decides to do.
+    return f"{dynamic_part}\n\n{_ANTI_DRIFT_PRINCIPLES}"
 
 
-__all__ = ["generate_outbound_system_prompt"]
+__all__ = ["generate_outbound_system_prompt", "_ANTI_DRIFT_PRINCIPLES"]
