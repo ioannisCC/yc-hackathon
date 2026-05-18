@@ -1,15 +1,27 @@
 """Tool schemas + dispatch for the voice agent. Each tool takes the active
-Business + caller phone and any tool args, returns a JSON-serializable dict."""
+Business + caller phone and any tool args, returns a JSON-serializable dict.
+
+Per-call idempotency: tools receive an optional `call_context` keyword
+(the active OutboundCall or CallLog row). book_appointment reads/writes
+`call_context.cal_booking_uid` to prevent the duplicate-booking loop
+where transcription drift makes the agent call book_appointment twice."""
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, TypeAlias
 
-from app.models import Business
+from app.db import session_scope
+from app.models import Business, CallLog, OutboundCall
 from app.services import calcom_svc, mail_svc, memory_svc, moss_svc
 from app.services.logging_svc import log_call_event
 
+log = logging.getLogger(__name__)
+
 ToolHandler = Callable[..., Awaitable[dict[str, Any]]]
+
+# Convenience alias for the union the webhook passes through.
+CallContext: TypeAlias = OutboundCall | CallLog
 
 
 # ---------- Tool schemas (Claude tool-use format) ------------------------------
@@ -38,7 +50,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "book_appointment",
-        "description": "Create a booking. Always confirm name, email, service, and start time verbally before calling.",
+        "description": (
+            "Create a booking. Always confirm name, email, service, and start "
+            "time verbally before calling. If the response has "
+            "already_booked=true, the booking was already created earlier in "
+            "this call — do NOT call book_appointment again; confirm the "
+            "existing booking to the caller and proceed to end_call."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -104,7 +122,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 
 
 async def lookup_business_info(
-    business: Business, _caller: str, query: str
+    business: Business, _caller: str, query: str, **_call_kwargs: Any
 ) -> dict[str, Any]:
     # Prefer semantic via Moss if this business has an index
     if business.moss_index_name:
@@ -152,7 +170,8 @@ def _pick_event_type(business: Business, service_name: str) -> int:
 
 
 async def get_availability(
-    business: Business, _caller: str, service_name: str, date: str
+    business: Business, _caller: str, service_name: str, date: str,
+    **_call_kwargs: Any,
 ) -> dict[str, Any]:
     event_id = _pick_event_type(business, service_name)
     start = f"{date}T00:00:00Z"
@@ -170,12 +189,56 @@ async def book_appointment(
     start_iso: str,
     caller_name: str,
     caller_email: str,
+    *,
+    call_context: CallContext | None = None,
+    **_call_kwargs: Any,
 ) -> dict[str, Any]:
+    # Per-call idempotency. If the agent already booked this call, return
+    # the cached uid INSTEAD of POSTing /bookings again. This prevents the
+    # duplicate-booking loop where Cal.com 400s on the dupe and the agent
+    # treats it as "slot unavailable" and proposes alternates until the
+    # 180s watchdog timeout — three calls, three real bookings.
+    cached_uid = getattr(call_context, "cal_booking_uid", None) if call_context else None
+    if cached_uid:
+        log.info(
+            "book_appointment idempotency hit: returning existing uid=%s",
+            cached_uid,
+        )
+        return {
+            "ok": True,
+            "already_booked": True,
+            "booking_uid": cached_uid,
+            "uid": cached_uid,
+            "start": start_iso,
+            "service": service_name,
+            "message": (
+                "Booking already created earlier in this call. "
+                "Confirm to the caller and proceed to end_call. Do not retry."
+            ),
+        }
+
     event_id = _pick_event_type(business, service_name)
     booking = await calcom_svc.create_booking(
         event_id, caller_name, caller_email, start_iso, business.timezone
     )
     uid = booking.get("uid") or booking.get("id")
+
+    if call_context is not None and uid:
+        # Persist on the in-memory instance first so concurrent parallel
+        # tool calls inside the same turn see the uid as soon as we write
+        # it, then merge to the DB so a future turn (even in a different
+        # process) also benefits.
+        call_context.cal_booking_uid = str(uid)
+        try:
+            async with session_scope() as s:
+                await s.merge(call_context)
+                await s.commit()
+        except Exception as e:
+            log_call_event(
+                business.id, "tool:book_appointment", "uid_persist_failed",
+                {"err": f"{type(e).__name__}: {e}"},
+            )
+
     # Confirmation email (fire & forget timing-wise but await for error propagation)
     try:
         await mail_svc.send_email(
@@ -193,11 +256,19 @@ async def book_appointment(
         log_call_event(
             business.id, "tool:book_appointment", "email_send_failed", {"err": str(e)}
         )
-    return {"uid": uid, "start": start_iso, "service": service_name}
+    return {
+        "ok": True,
+        "already_booked": False,
+        "booking_uid": uid,
+        "uid": uid,
+        "start": start_iso,
+        "service": service_name,
+    }
 
 
 async def reschedule_appointment(
-    business: Business, _caller: str, booking_uid: str, new_start_iso: str
+    business: Business, _caller: str, booking_uid: str, new_start_iso: str,
+    **_call_kwargs: Any,
 ) -> dict[str, Any]:
     return await calcom_svc.reschedule_booking(booking_uid, new_start_iso)
 
@@ -207,23 +278,26 @@ async def cancel_appointment(
     _caller: str,
     booking_uid: str,
     reason: str = "Caller requested",
+    **_call_kwargs: Any,
 ) -> dict[str, Any]:
     return await calcom_svc.cancel_booking(booking_uid, reason)
 
 
-async def recall_caller(business: Business, caller: str) -> dict[str, Any]:
+async def recall_caller(
+    business: Business, caller: str, **_call_kwargs: Any,
+) -> dict[str, Any]:
     return {"profile": await memory_svc.profile(caller)}
 
 
 async def remember_about_caller(
-    business: Business, caller: str, fact: str
+    business: Business, caller: str, fact: str, **_call_kwargs: Any,
 ) -> dict[str, Any]:
     await memory_svc.remember(caller, fact)
     return {"ok": True}
 
 
 async def escalate_to_human(
-    business: Business, _caller: str, reason: str
+    business: Business, _caller: str, reason: str, **_call_kwargs: Any,
 ) -> dict[str, Any]:
     # Phase 2 stub — real call transfer is Phase 3.
     log_call_event(business.id, "tool:escalate", "transfer_requested", {"reason": reason})
@@ -231,7 +305,8 @@ async def escalate_to_human(
 
 
 async def end_call(
-    _business: Business, _caller: str, farewell_message: str = ""
+    _business: Business, _caller: str, farewell_message: str = "",
+    **_call_kwargs: Any,
 ) -> dict[str, Any]:
     """Outbound-only tool. The brain returns end_call=True so the webhook
     can hang up and mark the OutboundCall completed. Tool result is mostly
@@ -279,13 +354,20 @@ OUTBOUND_TOOL_SCHEMAS: list[dict[str, Any]] = [END_CALL_SCHEMA]
 
 
 async def run_tool(
-    name: str, business: Business, caller_phone: str, args: dict[str, Any]
+    name: str,
+    business: Business,
+    caller_phone: str,
+    args: dict[str, Any],
+    *,
+    call_context: CallContext | None = None,
 ) -> dict[str, Any]:
     handler = DISPATCH.get(name)
     if handler is None:
         return {"error": f"unknown tool: {name}"}
     try:
-        return await handler(business, caller_phone, **args)
+        return await handler(
+            business, caller_phone, **args, call_context=call_context,
+        )
     except Exception as e:
         log_call_event(
             business.id, f"tool:{name}", "tool_error",

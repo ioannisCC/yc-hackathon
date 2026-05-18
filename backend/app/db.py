@@ -32,6 +32,15 @@ async def init_db() -> None:
 
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
+        # Best-effort additive migrations. create_all() does NOT alter
+        # existing tables, so columns added after the table was first
+        # created (like cal_booking_uid in Phase 7) need an explicit
+        # ALTER. Postgres-only — IF NOT EXISTS makes it safe to re-run.
+        for table in ("call_logs", "outbound_calls"):
+            await conn.exec_driver_sql(
+                f"ALTER TABLE {table} "
+                "ADD COLUMN IF NOT EXISTS cal_booking_uid TEXT NULL"
+            )
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:

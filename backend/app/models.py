@@ -107,6 +107,12 @@ class CallLog(SQLModel, table=True):
         default_factory=list, sa_column=Column(JSONB, nullable=False, default=list)
     )
 
+    # Idempotency anchor for book_appointment within this call. Once set, the
+    # tool returns the cached uid instead of POSTing /bookings again, which
+    # prevents the duplicate-booking loop when transcription drift makes the
+    # agent call book_appointment a second time with the same args.
+    cal_booking_uid: str | None = None
+
 
 class OutboundCall(SQLModel, table=True):
     """An outbound call placed BY our caller agent ON BEHALF OF Sir, dialing a
@@ -143,3 +149,6 @@ class OutboundCall(SQLModel, table=True):
     call_log_id: UUID | None = Field(
         default=None, foreign_key="call_logs.id", index=True
     )
+
+    # See CallLog.cal_booking_uid — same idempotency anchor on the outbound side.
+    cal_booking_uid: str | None = None

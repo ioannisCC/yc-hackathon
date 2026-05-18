@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.agent.brain import FALLBACK_REPLY, run_turn
-from app.agent.tools import OUTBOUND_TOOL_SCHEMAS
+from app.agent.tools import OUTBOUND_TOOL_SCHEMAS, CallContext
 from app.config import settings
 from app.db import session_scope
 from app.models import Business, CallLog, OutboundCall
@@ -94,6 +94,18 @@ async def get_business_by_agent_id(agent_id: str) -> Business | None:
             select(Business).where(Business.agentphone_agent_id == agent_id)
         )
         return r.scalar_one_or_none()
+
+
+async def _find_active_call_log_for_caller(
+    *, business_id: UUID, call_id: str | None, caller_phone: str,
+) -> CallLog | None:
+    """Pre-brain lookup for the inbound idempotency context. The CallLog
+    row is created by _persist_chunk on the first turn — on later turns we
+    fetch it here so book_appointment can read/write cal_booking_uid."""
+    async with session_scope() as s:
+        return await _find_existing_call(
+            s, business_id=business_id, call_id=call_id, caller_phone=caller_phone,
+        )
 
 
 async def _find_existing_call(
@@ -187,12 +199,24 @@ async def agentphone_webhook(request: Request) -> dict[str, Any]:
         caller_number = str(data.get("from") or "")
         recent_history = payload.get("recentHistory") or []
 
+        # Resolve the row tools should read/write idempotency state on.
+        # Outbound: the OutboundCall is already loaded above.
+        # Inbound: find the active CallLog for this caller (created on the
+        # first turn by _persist_chunk; None on the very first turn, which
+        # is OK because the agent hasn't booked anything yet).
+        call_context: CallContext | None
         if outbound_call is not None:
             system_prompt_override: str | None = outbound_call.dynamic_system_prompt
             tools_override: list[Any] | None = OUTBOUND_TOOL_SCHEMAS
+            call_context = outbound_call
         else:
             system_prompt_override = None
             tools_override = None
+            call_context = await _find_active_call_log_for_caller(
+                business_id=business.id,
+                call_id=call_id,
+                caller_phone=caller_number,
+            )
 
         end_call = False
         try:
@@ -204,6 +228,7 @@ async def agentphone_webhook(request: Request) -> dict[str, Any]:
                     recent_history=recent_history,
                     system_prompt_override=system_prompt_override,
                     tools_override=tools_override,
+                    call_context=call_context,
                 ),
                 timeout=BRAIN_TIMEOUT_S,
             )

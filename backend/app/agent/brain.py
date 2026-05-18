@@ -7,7 +7,7 @@ from typing import Any
 
 from anthropic import AsyncAnthropic
 
-from app.agent.tools import DISPATCH, TOOL_SCHEMAS, run_tool
+from app.agent.tools import DISPATCH, TOOL_SCHEMAS, CallContext, run_tool
 from app.config import settings
 from app.models import Business
 from app.services.logging_svc import log_call_event
@@ -61,6 +61,7 @@ async def run_turn(
     recent_history: list[Any],
     system_prompt_override: str | None = None,
     tools_override: list[dict[str, Any]] | None = None,
+    call_context: CallContext | None = None,
 ) -> tuple[str, list[str], bool]:
     """Run one turn of the voice agent.
 
@@ -105,7 +106,10 @@ async def run_turn(
             tool_calls = [b for b in resp.content if getattr(b, "type", "") == "tool_use"]
             results = await asyncio.gather(
                 *[
-                    run_tool(tc.name, business, caller_number, tc.input or {})
+                    run_tool(
+                        tc.name, business, caller_number, tc.input or {},
+                        call_context=call_context,
+                    )
                     for tc in tool_calls
                 ]
             )
